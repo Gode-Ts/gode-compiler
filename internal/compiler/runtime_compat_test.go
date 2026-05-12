@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"gode.dev/gode-compiler/internal/compiler"
-	"gode.dev/gode-compiler/internal/config"
+	"github.com/Gode-Ts/gode-compiler/internal/compiler"
+	"github.com/Gode-Ts/gode-compiler/internal/config"
 )
 
 func TestAsyncHandlerParamNamedCtxDoesNotCollideWithGoContext(t *testing.T) {

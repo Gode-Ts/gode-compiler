@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"gode.dev/gode-compiler/internal/frontend/parser"
+	"github.com/Gode-Ts/gode-compiler/internal/frontend/parser"
 )
 
 func TestParseNormalizesBackendTypeScript(t *testing.T) {

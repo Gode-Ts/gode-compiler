@@ -11,10 +11,10 @@ import (
 	"strings"
 	"unicode"
 
-	"gode.dev/gode-compiler/internal/config"
-	"gode.dev/gode-compiler/internal/diagnostics"
-	"gode.dev/gode-compiler/internal/ir"
-	"gode.dev/gode-compiler/internal/names"
+	"github.com/Gode-Ts/gode-compiler/internal/config"
+	"github.com/Gode-Ts/gode-compiler/internal/diagnostics"
+	"github.com/Gode-Ts/gode-compiler/internal/ir"
+	"github.com/Gode-Ts/gode-compiler/internal/names"
 )
 
 type gopressApp struct {

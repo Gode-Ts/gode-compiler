@@ -6,10 +6,10 @@ import (
 	"go/format"
 	"strings"
 
-	"gode.dev/gode-compiler/internal/diagnostics"
-	fast "gode.dev/gode-compiler/internal/frontend/ast"
-	"gode.dev/gode-compiler/internal/ir"
-	"gode.dev/gode-compiler/internal/names"
+	"github.com/Gode-Ts/gode-compiler/internal/diagnostics"
+	fast "github.com/Gode-Ts/gode-compiler/internal/frontend/ast"
+	"github.com/Gode-Ts/gode-compiler/internal/ir"
+	"github.com/Gode-Ts/gode-compiler/internal/names"
 )
 
 func Emit(mod ir.Module) (string, diagnostics.List) {

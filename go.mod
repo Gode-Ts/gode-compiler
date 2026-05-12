@@ -1,4 +1,4 @@
-module gode.dev/gode-compiler
+module github.com/Gode-Ts/gode-compiler
 
 go 1.23.0
 

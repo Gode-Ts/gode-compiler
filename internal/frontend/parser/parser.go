@@ -7,8 +7,8 @@ import (
 	tree_sitter "github.com/tree-sitter/go-tree-sitter"
 	tree_sitter_typescript "github.com/tree-sitter/tree-sitter-typescript/bindings/go"
 
-	"gode.dev/gode-compiler/internal/diagnostics"
-	fast "gode.dev/gode-compiler/internal/frontend/ast"
+	"github.com/Gode-Ts/gode-compiler/internal/diagnostics"
+	fast "github.com/Gode-Ts/gode-compiler/internal/frontend/ast"
 )
 
 func ParseFile(filename string, src []byte) (*fast.Module, diagnostics.List) {

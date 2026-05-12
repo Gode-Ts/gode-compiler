@@ -8,11 +8,11 @@ import (
 	"path/filepath"
 	"strings"
 
-	"gode.dev/gode-compiler/internal/compiler"
-	"gode.dev/gode-compiler/internal/config"
+	"github.com/Gode-Ts/gode-compiler/internal/compiler"
+	"github.com/Gode-Ts/gode-compiler/internal/config"
 )
 
-const version = "0.1.1"
+const version = "0.1.2"
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))

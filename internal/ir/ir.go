@@ -1,6 +1,6 @@
 package ir
 
-import fast "gode.dev/gode-compiler/internal/frontend/ast"
+import fast "github.com/Gode-Ts/gode-compiler/internal/frontend/ast"
 
 type Type = fast.Type
 type Expr = fast.Expr

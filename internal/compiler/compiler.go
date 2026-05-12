@@ -7,13 +7,13 @@ import (
 	"sort"
 	"strings"
 
-	"gode.dev/gode-compiler/internal/backend/goemit"
-	"gode.dev/gode-compiler/internal/config"
-	"gode.dev/gode-compiler/internal/diagnostics"
-	fast "gode.dev/gode-compiler/internal/frontend/ast"
-	"gode.dev/gode-compiler/internal/frontend/parser"
-	"gode.dev/gode-compiler/internal/ir"
-	"gode.dev/gode-compiler/internal/semantics"
+	"github.com/Gode-Ts/gode-compiler/internal/backend/goemit"
+	"github.com/Gode-Ts/gode-compiler/internal/config"
+	"github.com/Gode-Ts/gode-compiler/internal/diagnostics"
+	fast "github.com/Gode-Ts/gode-compiler/internal/frontend/ast"
+	"github.com/Gode-Ts/gode-compiler/internal/frontend/parser"
+	"github.com/Gode-Ts/gode-compiler/internal/ir"
+	"github.com/Gode-Ts/gode-compiler/internal/semantics"
 )
 
 type Result struct {
