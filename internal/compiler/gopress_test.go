@@ -151,3 +151,75 @@ export default app
 		}
 	}
 }
+
+func TestGopressBenchmarkHandlerPreservesLoopBody(t *testing.T) {
+	src := []byte(`
+import gopress, { Request, Response } from "gopress"
+
+const app = gopress()
+
+function runLoop(iterations: number) {
+  let sum = 0
+  for (let i = 0; i < iterations; i++) {
+    sum += i
+  }
+  return { iterations, sum }
+}
+
+app.get("/bench", async (req: Request, res: Response) => {
+  const iterations = 1000000
+  const start = performance.now()
+  const result = runLoop(iterations)
+  const durationMs = performance.now() - start
+  return res.status(200).json({ runtime: "gopress", durationMs, ...result })
+})
+
+export default app
+`)
+
+	result := compiler.CompileFile("app.ts", src, config.Default().WithFramework("gopress").WithPackage("main"))
+	if result.Diagnostics.HasErrors() {
+		t.Fatalf("unexpected diagnostics:\n%s", result.Diagnostics.String())
+	}
+	for _, want := range []string{
+		`"time"`,
+		"func runLoop(iterations float64) map[string]any",
+		"sum := 0.0",
+		"for i := 0.0; i < iterations; i++ {",
+		"sum += i",
+		`return map[string]any{"iterations": iterations, "sum": sum}`,
+		"const iterations = 1000000",
+		"start := time.Now()",
+		"result := runLoop(iterations)",
+		"durationMs := float64(time.Since(start).Microseconds()) / 1000.0",
+		`return res.Status(200).JSON(godeMergeJSON(map[string]any{"runtime": "gopress", "durationMs": durationMs}, result))`,
+		"func godeMergeJSON(parts ...map[string]any) map[string]any",
+	} {
+		if !strings.Contains(result.Go, want) {
+			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
+		}
+	}
+}
+
+func TestGopressUnsupportedHandlerStatementReportsDiagnostic(t *testing.T) {
+	src := []byte(`
+import gopress, { Request, Response } from "gopress"
+
+const app = gopress()
+
+app.get("/bad", async (req: Request, res: Response) => {
+  console.log("this must not be ignored")
+  return res.send("ok")
+})
+
+export default app
+`)
+
+	result := compiler.CompileFile("app.ts", src, config.Default().WithFramework("gopress").WithPackage("main"))
+	if !result.Diagnostics.HasErrors() {
+		t.Fatalf("expected unsupported statement diagnostic, got Go:\n%s", result.Go)
+	}
+	if !strings.Contains(result.Diagnostics.String(), "GODE_SUBSET_001") || !strings.Contains(result.Diagnostics.String(), "unsupported gopress statement") {
+		t.Fatalf("unexpected diagnostics:\n%s", result.Diagnostics.String())
+	}
+}
