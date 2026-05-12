@@ -34,6 +34,9 @@ func Lower(mod *fast.Module, cfg config.Config) (ir.Module, diagnostics.List) {
 	for _, decl := range mod.Declarations {
 		switch decl.Kind {
 		case "type_alias", "interface":
+			if decl.Declare {
+				continue
+			}
 			out.Declarations = append(out.Declarations, l.lowerTypeDecl(decl))
 		case "function":
 			lowered := l.lowerFunction(decl)
@@ -130,7 +133,7 @@ func (l *lowerer) lowerStatements(stmts []fast.Statement, inAsync bool) []fast.S
 		if containsAwait(stmt.Expr) && !inAsync {
 			l.diags = append(l.diags, diagnostics.Errorf(l.file, diagnostics.Position{Line: 1, Column: 1}, "GODE_SUBSET_001", "await is only valid inside async functions"))
 		}
-		l.validateExpr(stmt.Expr, scope, inAsync)
+		l.validateExpr(stmt.Expr, scope, inAsync, false)
 		out = append(out, stmt)
 	}
 	return out
@@ -151,7 +154,7 @@ func (l *lowerer) inferStatementType(stmt fast.Statement) *fast.Type {
 	return inferExprType(stmt.Expr)
 }
 
-func (l *lowerer) validateExpr(expr *fast.Expr, scope map[string]*fast.Type, inAsync bool) {
+func (l *lowerer) validateExpr(expr *fast.Expr, scope map[string]*fast.Type, inAsync bool, awaited bool) {
 	if expr == nil {
 		return
 	}
@@ -174,21 +177,28 @@ func (l *lowerer) validateExpr(expr *fast.Expr, scope map[string]*fast.Type, inA
 			} else if fn.ReturnType == nil || fn.ReturnType.Kind != "promise" {
 				l.diags = append(l.diags, diagnostics.Errorf(l.file, diagnostics.Position{Line: 1, Column: 1}, "GODE_TYPE_002", "await target %q must return Promise<T>", expr.Expr.Callee.Name))
 			}
+		} else {
+			l.diags = append(l.diags, diagnostics.Errorf(l.file, diagnostics.Position{Line: 1, Column: 1}, "GODE_TYPE_002", "await target must be a call returning Promise<T>"))
 		}
-		l.validateExpr(expr.Expr, scope, inAsync)
+		l.validateExpr(expr.Expr, scope, inAsync, true)
 	case "call":
-		l.validateExpr(expr.Callee, scope, inAsync)
+		if expr.Callee != nil && expr.Callee.Kind == "identifier" {
+			if fn, ok := l.funcs[expr.Callee.Name]; ok && fn.ReturnType != nil && fn.ReturnType.Kind == "promise" && !awaited {
+				l.diags = append(l.diags, diagnostics.Errorf(l.file, diagnostics.Position{Line: 1, Column: 1}, "GODE_TYPE_002", "async call %q must be awaited", expr.Callee.Name))
+			}
+		}
+		l.validateExpr(expr.Callee, scope, inAsync, false)
 		for i := range expr.Args {
-			l.validateExpr(&expr.Args[i], scope, inAsync)
+			l.validateExpr(&expr.Args[i], scope, inAsync, false)
 		}
 	case "binary":
-		l.validateExpr(expr.Left, scope, inAsync)
-		l.validateExpr(expr.Right, scope, inAsync)
+		l.validateExpr(expr.Left, scope, inAsync, false)
+		l.validateExpr(expr.Right, scope, inAsync, false)
 	case "member":
-		l.validateExpr(expr.Object, scope, inAsync)
+		l.validateExpr(expr.Object, scope, inAsync, false)
 	case "object":
 		for _, entry := range expr.Entries {
-			l.validateExpr(entry.Value, scope, inAsync)
+			l.validateExpr(entry.Value, scope, inAsync, false)
 		}
 	}
 }

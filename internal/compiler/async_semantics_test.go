@@ -69,3 +69,42 @@ export async function loadUser(id: string): Promise<User> {
 		t.Fatalf("return await should delegate the async call directly, got:\n%s", result.Go)
 	}
 }
+
+func TestNonAwaitedAsyncCallIsRejected(t *testing.T) {
+	src := []byte(`
+export type User = {
+  id: string
+}
+
+declare function fetchUser(id: string): Promise<User>
+
+export async function loadUser(id: string): Promise<User> {
+  return fetchUser(id)
+}
+`)
+
+	result := compiler.CompileFile("input.ts", src, config.Default().WithPackage("api"))
+	if !result.Diagnostics.HasErrors() {
+		t.Fatalf("expected diagnostics for non-awaited async call, got Go:\n%s", result.Go)
+	}
+	if !strings.Contains(result.Diagnostics.String(), `GODE_TYPE_002`) || !strings.Contains(result.Diagnostics.String(), `async call "fetchUser" must be awaited`) {
+		t.Fatalf("unexpected diagnostics:\n%s", result.Diagnostics.String())
+	}
+}
+
+func TestAwaitNonCallIsRejected(t *testing.T) {
+	src := []byte(`
+export async function loadValue(id: string): Promise<string> {
+  const value: string = id
+  return await value
+}
+`)
+
+	result := compiler.CompileFile("input.ts", src, config.Default().WithPackage("api"))
+	if !result.Diagnostics.HasErrors() {
+		t.Fatalf("expected diagnostics for await on non-call, got Go:\n%s", result.Go)
+	}
+	if !strings.Contains(result.Diagnostics.String(), `GODE_TYPE_002`) || !strings.Contains(result.Diagnostics.String(), `await target must be a call returning Promise<T>`) {
+		t.Fatalf("unexpected diagnostics:\n%s", result.Diagnostics.String())
+	}
+}

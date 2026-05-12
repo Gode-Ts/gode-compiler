@@ -103,10 +103,10 @@ func (p *subsetParser) parseDeclaration() fast.Declaration {
 	exported := p.matchIdent("export")
 	declare := p.matchIdent("declare")
 	if p.matchIdent("type") {
-		return p.parseTypeAlias(exported)
+		return p.parseTypeAlias(exported, declare)
 	}
 	if p.matchIdent("interface") {
-		return p.parseInterface(exported)
+		return p.parseInterface(exported, declare)
 	}
 	async := p.matchIdent("async")
 	if p.matchIdent("function") {
@@ -121,18 +121,18 @@ func (p *subsetParser) parseDeclaration() fast.Declaration {
 	return fast.Declaration{}
 }
 
-func (p *subsetParser) parseTypeAlias(exported bool) fast.Declaration {
+func (p *subsetParser) parseTypeAlias(exported, declare bool) fast.Declaration {
 	name := p.expectIdent()
 	p.expect("symbol", "=")
 	typ := p.parseType()
 	p.optionalTerminator()
-	return fast.Declaration{Kind: "type_alias", Name: name.value, Exported: exported, Type: typ}
+	return fast.Declaration{Kind: "type_alias", Name: name.value, Exported: exported, Declare: declare, Type: typ}
 }
 
-func (p *subsetParser) parseInterface(exported bool) fast.Declaration {
+func (p *subsetParser) parseInterface(exported, declare bool) fast.Declaration {
 	name := p.expectIdent()
 	typ := p.parseObjectType()
-	return fast.Declaration{Kind: "interface", Name: name.value, Exported: exported, Type: typ}
+	return fast.Declaration{Kind: "interface", Name: name.value, Exported: exported, Declare: declare, Type: typ}
 }
 
 func (p *subsetParser) parseFunction(exported, async, declare bool) fast.Declaration {
