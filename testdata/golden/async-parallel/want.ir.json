@@ -1,0 +1,203 @@
+{
+  "packageName": "api",
+  "usesAsync": true,
+  "declarations": [
+    {
+      "kind": "struct",
+      "name": "User",
+      "exported": true,
+      "fields": [
+        {
+          "name": "id",
+          "goName": "ID",
+          "type": {
+            "kind": "primitive",
+            "name": "string"
+          },
+          "jsonName": "id"
+        }
+      ]
+    },
+    {
+      "kind": "struct",
+      "name": "Profile",
+      "exported": true,
+      "fields": [
+        {
+          "name": "id",
+          "goName": "ID",
+          "type": {
+            "kind": "primitive",
+            "name": "string"
+          },
+          "jsonName": "id"
+        }
+      ]
+    },
+    {
+      "kind": "struct",
+      "name": "UserBundle",
+      "exported": true,
+      "fields": [
+        {
+          "name": "user",
+          "goName": "User",
+          "type": {
+            "kind": "reference",
+            "name": "User"
+          },
+          "jsonName": "user"
+        },
+        {
+          "name": "profile",
+          "goName": "Profile",
+          "type": {
+            "kind": "reference",
+            "name": "Profile"
+          },
+          "jsonName": "profile"
+        }
+      ]
+    },
+    {
+      "kind": "external_function",
+      "name": "fetchUser",
+      "goName": "FetchUser",
+      "params": [
+        {
+          "name": "id",
+          "goName": "id",
+          "type": {
+            "kind": "primitive",
+            "name": "string"
+          }
+        }
+      ],
+      "returnType": {
+        "kind": "promise",
+        "inner": {
+          "kind": "reference",
+          "name": "User"
+        }
+      }
+    },
+    {
+      "kind": "external_function",
+      "name": "fetchProfile",
+      "goName": "FetchProfile",
+      "params": [
+        {
+          "name": "id",
+          "goName": "id",
+          "type": {
+            "kind": "primitive",
+            "name": "string"
+          }
+        }
+      ],
+      "returnType": {
+        "kind": "promise",
+        "inner": {
+          "kind": "reference",
+          "name": "Profile"
+        }
+      }
+    },
+    {
+      "kind": "function",
+      "name": "loadBundle",
+      "goName": "LoadBundle",
+      "exported": true,
+      "async": true,
+      "params": [
+        {
+          "name": "id",
+          "goName": "id",
+          "type": {
+            "kind": "primitive",
+            "name": "string"
+          }
+        }
+      ],
+      "returnType": {
+        "kind": "promise",
+        "inner": {
+          "kind": "reference",
+          "name": "UserBundle"
+        }
+      },
+      "body": [
+        {
+          "kind": "var",
+          "name": "user",
+          "type": {
+            "kind": "reference",
+            "name": "User"
+          },
+          "expr": {
+            "kind": "await",
+            "expr": {
+              "kind": "call",
+              "callee": {
+                "kind": "identifier",
+                "name": "fetchUser"
+              },
+              "args": [
+                {
+                  "kind": "identifier",
+                  "name": "id"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "kind": "var",
+          "name": "profile",
+          "type": {
+            "kind": "reference",
+            "name": "Profile"
+          },
+          "expr": {
+            "kind": "await",
+            "expr": {
+              "kind": "call",
+              "callee": {
+                "kind": "identifier",
+                "name": "fetchProfile"
+              },
+              "args": [
+                {
+                  "kind": "identifier",
+                  "name": "id"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "kind": "return",
+          "expr": {
+            "kind": "object",
+            "entries": [
+              {
+                "key": "user",
+                "value": {
+                  "kind": "identifier",
+                  "name": "user"
+                }
+              },
+              {
+                "key": "profile",
+                "value": {
+                  "kind": "identifier",
+                  "name": "profile"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

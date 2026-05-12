@@ -1,0 +1,81 @@
+{
+  "packageName": "api",
+  "declarations": [
+    {
+      "kind": "struct",
+      "name": "User",
+      "exported": true,
+      "fields": [
+        {
+          "name": "id",
+          "goName": "ID",
+          "type": {
+            "kind": "primitive",
+            "name": "string"
+          },
+          "jsonName": "id"
+        },
+        {
+          "name": "age",
+          "goName": "Age",
+          "type": {
+            "kind": "primitive",
+            "name": "number"
+          },
+          "jsonName": "age"
+        },
+        {
+          "name": "active",
+          "goName": "Active",
+          "optional": true,
+          "type": {
+            "kind": "primitive",
+            "name": "boolean"
+          },
+          "jsonName": "active"
+        }
+      ]
+    },
+    {
+      "kind": "function",
+      "name": "isAdult",
+      "goName": "IsAdult",
+      "exported": true,
+      "params": [
+        {
+          "name": "user",
+          "goName": "user",
+          "type": {
+            "kind": "reference",
+            "name": "User"
+          }
+        }
+      ],
+      "returnType": {
+        "kind": "primitive",
+        "name": "boolean"
+      },
+      "body": [
+        {
+          "kind": "return",
+          "expr": {
+            "kind": "binary",
+            "op": "\u003e=",
+            "left": {
+              "kind": "member",
+              "object": {
+                "kind": "identifier",
+                "name": "user"
+              },
+              "property": "age"
+            },
+            "right": {
+              "kind": "number",
+              "value": "18"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

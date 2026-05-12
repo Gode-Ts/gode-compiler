@@ -1,0 +1,9 @@
+{
+  "entry": "./src",
+  "out": "./gen",
+  "package": "api",
+  "moduleMode": "single-package",
+  "jsonTags": true,
+  "numberMode": "float64",
+  "strict": true
+}
