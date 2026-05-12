@@ -223,3 +223,51 @@ export default app
 		t.Fatalf("unexpected diagnostics:\n%s", result.Diagnostics.String())
 	}
 }
+
+func TestGopressJSONStringAccumulatorUsesBuilder(t *testing.T) {
+	src := []byte(`
+import gopress, { Request, Response } from "gopress"
+
+const app = gopress()
+
+app.get("/json", async (req: Request, res: Response) => {
+  const start = performance.now()
+  let payload = "{\"items\":["
+  for (let i = 0; i < 3; i++) {
+    if (i > 0) {
+      payload += ","
+    }
+    payload += "{\"id\":" + i + ",\"name\":\"note\"}"
+  }
+  payload += "]}"
+  const durationMs = performance.now() - start
+  return res.type("application/json").send(payload)
+})
+
+export default app
+`)
+
+	result := compiler.CompileFile("app.ts", src, config.Default().WithFramework("gopress").WithPackage("main"))
+	if result.Diagnostics.HasErrors() {
+		t.Fatalf("unexpected diagnostics:\n%s", result.Diagnostics.String())
+	}
+	for _, want := range []string{
+		`"strings"`,
+		`"strconv"`,
+		"var payload strings.Builder",
+		`payload.WriteString("{\"items\":[")`,
+		`payload.WriteString(",")`,
+		`payload.WriteString("{\"id\":")`,
+		`payload.WriteString(strconv.FormatFloat(i, 'f', -1, 64))`,
+		`payload.WriteString(",\"name\":\"note\"}")`,
+		`payload.WriteString("]}")`,
+		`return res.Type("application/json").Send(payload.String())`,
+	} {
+		if !strings.Contains(result.Go, want) {
+			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
+		}
+	}
+	if strings.Contains(result.Go, "payload +=") {
+		t.Fatalf("generated Go should not concatenate payload repeatedly:\n%s", result.Go)
+	}
+}

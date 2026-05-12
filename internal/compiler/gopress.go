@@ -20,7 +20,6 @@ import (
 type gopressApp struct {
 	packageName string
 	path        string
-	source      string
 	appName     string
 	vars        map[string]string
 	helpers     []gopressFunction
@@ -52,6 +51,23 @@ type gopressCall struct {
 	Receiver string
 	Method   string
 	Args     []string
+}
+
+type gopressEmitContext struct {
+	imports        map[string]bool
+	needsMergeJSON bool
+}
+
+type gopressRenderedFunc struct {
+	Header     string
+	Lines      []string
+	ReturnType string
+}
+
+type gopressBodyContext struct {
+	emit     *gopressEmitContext
+	path     string
+	builders map[string]bool
 }
 
 type gopressRouteMetadata struct {
@@ -87,7 +103,7 @@ func CompileGopress(path string, src []byte, cfg config.Config) Result {
 }
 
 func parseGopress(path string, src string, cfg config.Config) *gopressApp {
-	app := &gopressApp{packageName: cfg.Package, path: path, source: src, vars: map[string]string{}}
+	app := &gopressApp{packageName: cfg.Package, path: path, vars: map[string]string{}}
 	if app.packageName == "" {
 		app.packageName = "main"
 	}
@@ -296,6 +312,43 @@ func scanGopressCalls(src string, skip [][2]int) []gopressCall {
 }
 
 func (a *gopressApp) emit() (string, diagnostics.List) {
+	ctx := newGopressEmitContext()
+	ctx.addImport("github.com/Gode-Ts/gopress")
+	var helperBlocks []gopressRenderedFunc
+	for _, helper := range a.helpers {
+		params := make([]string, 0, len(helper.Params))
+		for _, param := range helper.Params {
+			params = append(params, fmt.Sprintf("%s %s", param.Name, param.GoType))
+		}
+		returnType := ""
+		if helper.ReturnType != "" {
+			returnType = " " + helper.ReturnType
+		}
+		lines, bodyDiags := compileGopressBody(ctx, a.path, helper.Body)
+		a.diags = append(a.diags, bodyDiags...)
+		helperBlocks = append(helperBlocks, gopressRenderedFunc{
+			Header:     fmt.Sprintf("func %s(%s)%s {", helper.Name, strings.Join(params, ", "), returnType),
+			Lines:      lines,
+			ReturnType: helper.ReturnType,
+		})
+	}
+	var handlerBlocks []gopressRenderedFunc
+	for _, handler := range a.handlers {
+		header := ""
+		if handler.IsError {
+			header = fmt.Sprintf("func %s(err error, req *gopress.Request, res *gopress.Response, next gopress.NextFunc) error {", handler.GoName)
+		} else {
+			header = fmt.Sprintf("func %s(req *gopress.Request, res *gopress.Response, next gopress.NextFunc) error {", handler.GoName)
+		}
+		lines, bodyDiags := compileGopressBody(ctx, a.path, handler.Body)
+		a.diags = append(a.diags, bodyDiags...)
+		handlerBlocks = append(handlerBlocks, gopressRenderedFunc{Header: header, Lines: lines})
+	}
+	var callLines []string
+	for _, call := range a.calls {
+		callLines = append(callLines, a.emitGopressCall(ctx, call)...)
+	}
+
 	var b bytes.Buffer
 	w := func(format string, args ...any) {
 		if len(args) == 0 {
@@ -310,13 +363,12 @@ func (a *gopressApp) emit() (string, diagnostics.List) {
 	w("package %s", a.packageName)
 	w("")
 	w("import (")
-	w("%q", "github.com/Gode-Ts/gopress")
-	if strings.Contains(a.source, "performance.now()") {
-		w("%q", "time")
+	for _, imp := range ctx.sortedImports() {
+		w("%q", imp)
 	}
 	w(")")
 	w("")
-	if strings.Contains(a.source, "...") {
+	if ctx.needsMergeJSON {
 		w("func godeMergeJSON(parts ...map[string]any) map[string]any {")
 		w("out := map[string]any{}")
 		w("for _, part := range parts {")
@@ -328,19 +380,9 @@ func (a *gopressApp) emit() (string, diagnostics.List) {
 		w("}")
 		w("")
 	}
-	for _, helper := range a.helpers {
-		params := make([]string, 0, len(helper.Params))
-		for _, param := range helper.Params {
-			params = append(params, fmt.Sprintf("%s %s", param.Name, param.GoType))
-		}
-		returnType := ""
-		if helper.ReturnType != "" {
-			returnType = " " + helper.ReturnType
-		}
-		w("func %s(%s)%s {", helper.Name, strings.Join(params, ", "), returnType)
-		lines, bodyDiags := compileGopressBody(a.path, helper.Body)
-		a.diags = append(a.diags, bodyDiags...)
-		for _, line := range lines {
+	for _, helper := range helperBlocks {
+		w("%s", helper.Header)
+		for _, line := range helper.Lines {
 			w("%s", line)
 		}
 		if helper.ReturnType != "" {
@@ -349,15 +391,9 @@ func (a *gopressApp) emit() (string, diagnostics.List) {
 		w("}")
 		w("")
 	}
-	for _, handler := range a.handlers {
-		if handler.IsError {
-			w("func %s(err error, req *gopress.Request, res *gopress.Response, next gopress.NextFunc) error {", handler.GoName)
-		} else {
-			w("func %s(req *gopress.Request, res *gopress.Response, next gopress.NextFunc) error {", handler.GoName)
-		}
-		lines, bodyDiags := compileGopressBody(a.path, handler.Body)
-		a.diags = append(a.diags, bodyDiags...)
-		for _, line := range lines {
+	for _, handler := range handlerBlocks {
+		w("%s", handler.Header)
+		for _, line := range handler.Lines {
 			w("%s", line)
 		}
 		w("return nil")
@@ -373,10 +409,8 @@ func (a *gopressApp) emit() (string, diagnostics.List) {
 			w("%s := gopress.Router()", name)
 		}
 	}
-	for _, call := range a.calls {
-		for _, line := range a.emitGopressCall(call) {
-			w("%s", line)
-		}
+	for _, line := range callLines {
+		w("%s", line)
 	}
 	w("return %s", a.appName)
 	w("}")
@@ -447,18 +481,35 @@ func sortedVars(vars map[string]string) [][2]string {
 	return out
 }
 
-func (a *gopressApp) emitGopressCall(call gopressCall) []string {
+func newGopressEmitContext() *gopressEmitContext {
+	return &gopressEmitContext{imports: map[string]bool{}}
+}
+
+func (c *gopressEmitContext) addImport(path string) {
+	c.imports[path] = true
+}
+
+func (c *gopressEmitContext) sortedImports() []string {
+	imports := make([]string, 0, len(c.imports))
+	for path := range c.imports {
+		imports = append(imports, path)
+	}
+	sort.Strings(imports)
+	return imports
+}
+
+func (a *gopressApp) emitGopressCall(ctx *gopressEmitContext, call gopressCall) []string {
 	method := strings.ToLower(call.Method)
 	switch method {
 	case "use":
-		return a.emitUseCall(call)
+		return a.emitUseCall(ctx, call)
 	case "all", "get", "post", "put", "patch", "delete", "options", "head":
 		if len(call.Args) < 2 {
 			return nil
 		}
 		args := []string{call.Args[0]}
 		for _, arg := range call.Args[1:] {
-			args = append(args, a.compileHandlerArg(arg))
+			args = append(args, a.compileHandlerArg(ctx, arg))
 		}
 		return []string{fmt.Sprintf("%s.%s(%s)", call.Receiver, names.Exported(method), strings.Join(args, ", "))}
 	case "route.all", "route.get", "route.post", "route.put", "route.patch", "route.delete", "route.options", "route.head":
@@ -468,7 +519,7 @@ func (a *gopressApp) emitGopressCall(call gopressCall) []string {
 		routeMethod := strings.TrimPrefix(method, "route.")
 		args := make([]string, 0, len(call.Args)-1)
 		for _, arg := range call.Args[1:] {
-			args = append(args, a.compileHandlerArg(arg))
+			args = append(args, a.compileHandlerArg(ctx, arg))
 		}
 		return []string{fmt.Sprintf("%s.Route(%s).%s(%s)", call.Receiver, call.Args[0], names.Exported(routeMethod), strings.Join(args, ", "))}
 	default:
@@ -476,7 +527,7 @@ func (a *gopressApp) emitGopressCall(call gopressCall) []string {
 	}
 }
 
-func (a *gopressApp) emitUseCall(call gopressCall) []string {
+func (a *gopressApp) emitUseCall(ctx *gopressEmitContext, call gopressCall) []string {
 	var lines []string
 	prefix := ""
 	args := call.Args
@@ -487,20 +538,20 @@ func (a *gopressApp) emitUseCall(call gopressCall) []string {
 	for _, arg := range args {
 		trimmed := strings.TrimSpace(arg)
 		if a.isErrorHandlerArg(trimmed) {
-			lines = append(lines, fmt.Sprintf("%s.UseError(%s)", call.Receiver, a.compileErrorHandlerArg(trimmed)))
+			lines = append(lines, fmt.Sprintf("%s.UseError(%s)", call.Receiver, a.compileErrorHandlerArg(ctx, trimmed)))
 			continue
 		}
 		useArgs := []string{}
 		if prefix != "" {
 			useArgs = append(useArgs, prefix)
 		}
-		useArgs = append(useArgs, a.compileUseArg(trimmed))
+		useArgs = append(useArgs, a.compileUseArg(ctx, trimmed))
 		lines = append(lines, fmt.Sprintf("%s.Use(%s)", call.Receiver, strings.Join(useArgs, ", ")))
 	}
 	return lines
 }
 
-func (a *gopressApp) compileUseArg(arg string) string {
+func (a *gopressApp) compileUseArg(ctx *gopressEmitContext, arg string) string {
 	trimmed := strings.TrimSpace(arg)
 	switch {
 	case trimmed == "gopress.json()":
@@ -510,14 +561,14 @@ func (a *gopressApp) compileUseArg(arg string) string {
 	case isStringLiteral(trimmed):
 		return trimmed
 	default:
-		return a.compileHandlerArg(trimmed)
+		return a.compileHandlerArg(ctx, trimmed)
 	}
 }
 
-func (a *gopressApp) compileHandlerArg(arg string) string {
+func (a *gopressApp) compileHandlerArg(ctx *gopressEmitContext, arg string) string {
 	trimmed := strings.TrimSpace(arg)
 	if strings.Contains(trimmed, "=>") {
-		return a.compileInlineHandler(trimmed)
+		return a.compileInlineHandler(ctx, trimmed)
 	}
 	if _, ok := a.vars[trimmed]; ok {
 		return trimmed
@@ -525,10 +576,10 @@ func (a *gopressApp) compileHandlerArg(arg string) string {
 	return names.Exported(trimmed)
 }
 
-func (a *gopressApp) compileErrorHandlerArg(arg string) string {
+func (a *gopressApp) compileErrorHandlerArg(ctx *gopressEmitContext, arg string) string {
 	trimmed := strings.TrimSpace(arg)
 	if strings.Contains(trimmed, "=>") {
-		return a.compileInlineErrorHandler(trimmed)
+		return a.compileInlineErrorHandler(ctx, trimmed)
 	}
 	return names.Exported(trimmed)
 }
@@ -545,29 +596,38 @@ func (a *gopressApp) isErrorHandlerArg(arg string) bool {
 	return false
 }
 
-func (a *gopressApp) compileInlineHandler(src string) string {
+func (a *gopressApp) compileInlineHandler(ctx *gopressEmitContext, src string) string {
 	bodyStart := strings.Index(src, "{")
 	bodyEnd := strings.LastIndex(src, "}")
 	if bodyStart < 0 || bodyEnd < bodyStart {
 		return "func(req *gopress.Request, res *gopress.Response, next gopress.NextFunc) error { return nil }"
 	}
-	lines, bodyDiags := compileGopressBody(a.path, src[bodyStart+1:bodyEnd])
+	lines, bodyDiags := compileGopressBody(ctx, a.path, src[bodyStart+1:bodyEnd])
 	a.diags = append(a.diags, bodyDiags...)
 	return fmt.Sprintf("func(req *gopress.Request, res *gopress.Response, next gopress.NextFunc) error {\n%s\nreturn nil\n}", strings.Join(lines, "\n"))
 }
 
-func (a *gopressApp) compileInlineErrorHandler(src string) string {
+func (a *gopressApp) compileInlineErrorHandler(ctx *gopressEmitContext, src string) string {
 	bodyStart := strings.Index(src, "{")
 	bodyEnd := strings.LastIndex(src, "}")
 	if bodyStart < 0 || bodyEnd < bodyStart {
 		return "func(err error, req *gopress.Request, res *gopress.Response, next gopress.NextFunc) error { return nil }"
 	}
-	lines, bodyDiags := compileGopressBody(a.path, src[bodyStart+1:bodyEnd])
+	lines, bodyDiags := compileGopressBody(ctx, a.path, src[bodyStart+1:bodyEnd])
 	a.diags = append(a.diags, bodyDiags...)
 	return fmt.Sprintf("func(err error, req *gopress.Request, res *gopress.Response, next gopress.NextFunc) error {\n%s\nreturn nil\n}", strings.Join(lines, "\n"))
 }
 
-func compileGopressBody(path string, body string) ([]string, diagnostics.List) {
+func compileGopressBody(ctx *gopressEmitContext, path string, body string) ([]string, diagnostics.List) {
+	builders := discoverStringBuilderVars(body)
+	if len(builders) > 0 {
+		ctx.addImport("strings")
+	}
+	bodyCtx := &gopressBodyContext{emit: ctx, path: path, builders: builders}
+	return bodyCtx.compile(body)
+}
+
+func (c *gopressBodyContext) compile(body string) ([]string, diagnostics.List) {
 	var out []string
 	var diags diagnostics.List
 	for pos := 0; pos < len(body); {
@@ -577,18 +637,18 @@ func compileGopressBody(path string, body string) ([]string, diagnostics.List) {
 		}
 		switch {
 		case hasKeywordAt(body, pos, "if"):
-			lines, next, blockDiags := compileGopressIf(path, body, pos)
+			lines, next, blockDiags := c.compileIf(body, pos)
 			out = append(out, lines...)
 			diags = append(diags, blockDiags...)
 			pos = next
 		case hasKeywordAt(body, pos, "for"):
-			lines, next, blockDiags := compileGopressFor(path, body, pos)
+			lines, next, blockDiags := c.compileFor(body, pos)
 			out = append(out, lines...)
 			diags = append(diags, blockDiags...)
 			pos = next
 		default:
 			stmt, next := readGopressStatement(body, pos)
-			lines, stmtDiags := compileGopressStatement(path, stmt)
+			lines, stmtDiags := c.compileStatement(stmt)
 			out = append(out, lines...)
 			diags = append(diags, stmtDiags...)
 			pos = next
@@ -597,25 +657,25 @@ func compileGopressBody(path string, body string) ([]string, diagnostics.List) {
 	return out, diags
 }
 
-func compileGopressIf(path string, src string, pos int) ([]string, int, diagnostics.List) {
+func (c *gopressBodyContext) compileIf(src string, pos int) ([]string, int, diagnostics.List) {
 	openCond := skipSpace(src, pos+len("if"))
 	if openCond >= len(src) || src[openCond] != '(' {
-		return nil, len(src), diagnostics.List{unsupportedGopressStatement(path, readRestLine(src, pos))}
+		return nil, len(src), diagnostics.List{unsupportedGopressStatement(c.path, readRestLine(src, pos))}
 	}
 	closeCond := findMatching(src, openCond, '(', ')')
 	if closeCond < 0 {
-		return nil, len(src), diagnostics.List{unsupportedGopressStatement(path, readRestLine(src, pos))}
+		return nil, len(src), diagnostics.List{unsupportedGopressStatement(c.path, readRestLine(src, pos))}
 	}
 	openBody := skipSpace(src, closeCond+1)
 	if openBody >= len(src) || src[openBody] != '{' {
-		return nil, len(src), diagnostics.List{unsupportedGopressStatement(path, readRestLine(src, pos))}
+		return nil, len(src), diagnostics.List{unsupportedGopressStatement(c.path, readRestLine(src, pos))}
 	}
 	closeBody := findMatching(src, openBody, '{', '}')
 	if closeBody < 0 {
-		return nil, len(src), diagnostics.List{unsupportedGopressStatement(path, readRestLine(src, pos))}
+		return nil, len(src), diagnostics.List{unsupportedGopressStatement(c.path, readRestLine(src, pos))}
 	}
-	bodyLines, diags := compileGopressBody(path, src[openBody+1:closeBody])
-	out := []string{fmt.Sprintf("if %s {", compileGopressExpr(src[openCond+1:closeCond]))}
+	bodyLines, diags := c.compile(src[openBody+1 : closeBody])
+	out := []string{fmt.Sprintf("if %s {", c.compileExpr(src[openCond+1:closeCond]))}
 	out = append(out, bodyLines...)
 	next := closeBody + 1
 	elsePos := skipGopressSeparators(src, next)
@@ -623,7 +683,7 @@ func compileGopressIf(path string, src string, pos int) ([]string, int, diagnost
 		afterElse := skipSpace(src, elsePos+len("else"))
 		switch {
 		case hasKeywordAt(src, afterElse, "if"):
-			elseLines, elseNext, elseDiags := compileGopressIf(path, src, afterElse)
+			elseLines, elseNext, elseDiags := c.compileIf(src, afterElse)
 			out = append(out, "} else {")
 			out = append(out, elseLines...)
 			out = append(out, "}")
@@ -632,94 +692,102 @@ func compileGopressIf(path string, src string, pos int) ([]string, int, diagnost
 		case afterElse < len(src) && src[afterElse] == '{':
 			closeElse := findMatching(src, afterElse, '{', '}')
 			if closeElse < 0 {
-				diags = append(diags, unsupportedGopressStatement(path, readRestLine(src, elsePos)))
+				diags = append(diags, unsupportedGopressStatement(c.path, readRestLine(src, elsePos)))
 				out = append(out, "}")
 				return out, len(src), diags
 			}
-			elseBody, elseDiags := compileGopressBody(path, src[afterElse+1:closeElse])
+			elseBody, elseDiags := c.compile(src[afterElse+1 : closeElse])
 			out = append(out, "} else {")
 			out = append(out, elseBody...)
 			out = append(out, "}")
 			diags = append(diags, elseDiags...)
 			return out, closeElse + 1, diags
 		}
-		diags = append(diags, unsupportedGopressStatement(path, readRestLine(src, elsePos)))
+		diags = append(diags, unsupportedGopressStatement(c.path, readRestLine(src, elsePos)))
 	}
 	out = append(out, "}")
 	return out, next, diags
 }
 
-func compileGopressFor(path string, src string, pos int) ([]string, int, diagnostics.List) {
+func (c *gopressBodyContext) compileFor(src string, pos int) ([]string, int, diagnostics.List) {
 	openHeader := skipSpace(src, pos+len("for"))
 	if openHeader >= len(src) || src[openHeader] != '(' {
-		return nil, len(src), diagnostics.List{unsupportedGopressStatement(path, readRestLine(src, pos))}
+		return nil, len(src), diagnostics.List{unsupportedGopressStatement(c.path, readRestLine(src, pos))}
 	}
 	closeHeader := findMatching(src, openHeader, '(', ')')
 	if closeHeader < 0 {
-		return nil, len(src), diagnostics.List{unsupportedGopressStatement(path, readRestLine(src, pos))}
+		return nil, len(src), diagnostics.List{unsupportedGopressStatement(c.path, readRestLine(src, pos))}
 	}
 	openBody := skipSpace(src, closeHeader+1)
 	if openBody >= len(src) || src[openBody] != '{' {
-		return nil, len(src), diagnostics.List{unsupportedGopressStatement(path, readRestLine(src, pos))}
+		return nil, len(src), diagnostics.List{unsupportedGopressStatement(c.path, readRestLine(src, pos))}
 	}
 	closeBody := findMatching(src, openBody, '{', '}')
 	if closeBody < 0 {
-		return nil, len(src), diagnostics.List{unsupportedGopressStatement(path, readRestLine(src, pos))}
+		return nil, len(src), diagnostics.List{unsupportedGopressStatement(c.path, readRestLine(src, pos))}
 	}
 	parts := splitTopLevelSemicolons(src[openHeader+1 : closeHeader])
 	if len(parts) != 3 {
-		return nil, closeBody + 1, diagnostics.List{unsupportedGopressStatement(path, readRestLine(src, pos))}
+		return nil, closeBody + 1, diagnostics.List{unsupportedGopressStatement(c.path, readRestLine(src, pos))}
 	}
-	init, ok := compileGopressForInit(parts[0])
+	init, ok := c.compileForInit(parts[0])
 	if !ok {
-		return nil, closeBody + 1, diagnostics.List{unsupportedGopressStatement(path, readRestLine(src, pos))}
+		return nil, closeBody + 1, diagnostics.List{unsupportedGopressStatement(c.path, readRestLine(src, pos))}
 	}
-	post, ok := compileGopressForPost(parts[2])
+	post, ok := c.compileForPost(parts[2])
 	if !ok {
-		return nil, closeBody + 1, diagnostics.List{unsupportedGopressStatement(path, readRestLine(src, pos))}
+		return nil, closeBody + 1, diagnostics.List{unsupportedGopressStatement(c.path, readRestLine(src, pos))}
 	}
-	bodyLines, diags := compileGopressBody(path, src[openBody+1:closeBody])
-	out := []string{fmt.Sprintf("for %s; %s; %s {", init, compileGopressExpr(parts[1]), post)}
+	bodyLines, diags := c.compile(src[openBody+1 : closeBody])
+	out := []string{fmt.Sprintf("for %s; %s; %s {", init, c.compileExpr(parts[1]), post)}
 	out = append(out, bodyLines...)
 	out = append(out, "}")
 	return out, closeBody + 1, diags
 }
 
-func compileGopressStatement(path string, stmt string) ([]string, diagnostics.List) {
+func (c *gopressBodyContext) compileStatement(stmt string) ([]string, diagnostics.List) {
 	stmt = strings.TrimSpace(strings.TrimSuffix(stmt, ";"))
 	if stmt == "" {
 		return nil, nil
 	}
-	if line, ok := compileGopressVarDecl(stmt, false); ok {
-		return []string{line}, nil
+	if lines, ok := c.compileVarDecl(stmt, false); ok {
+		return lines, nil
 	}
 	if strings.HasPrefix(stmt, "return ") {
-		return []string{"return " + compileGopressExpr(strings.TrimSpace(strings.TrimPrefix(stmt, "return ")))}, nil
+		return []string{"return " + c.compileExpr(strings.TrimSpace(strings.TrimPrefix(stmt, "return ")))}, nil
 	}
 	if strings.HasPrefix(stmt, "res.") || strings.HasPrefix(stmt, "next(") {
-		return []string{"return " + compileGopressExpr(stmt)}, nil
+		return []string{"return " + c.compileExpr(stmt)}, nil
 	}
-	if line, ok := compileGopressAssignment(stmt); ok {
-		return []string{line}, nil
+	if lines, ok := c.compileAssignment(stmt); ok {
+		return lines, nil
 	}
 	if regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*\s*\(`).MatchString(stmt) {
-		return []string{compileGopressExpr(stmt)}, nil
+		return []string{c.compileExpr(stmt)}, nil
 	}
-	return nil, diagnostics.List{unsupportedGopressStatement(path, stmt)}
+	return nil, diagnostics.List{unsupportedGopressStatement(c.path, stmt)}
 }
 
-func compileGopressForInit(stmt string) (string, bool) {
-	if line, ok := compileGopressVarDecl(stmt, true); ok {
-		return line, true
+func (c *gopressBodyContext) compileForInit(stmt string) (string, bool) {
+	if lines, ok := c.compileVarDecl(stmt, true); ok && len(lines) == 1 {
+		return lines[0], true
 	}
-	return compileGopressAssignment(stmt)
+	lines, ok := c.compileAssignment(stmt)
+	if !ok || len(lines) != 1 {
+		return "", false
+	}
+	return lines[0], true
 }
 
-func compileGopressForPost(stmt string) (string, bool) {
-	return compileGopressAssignment(stmt)
+func (c *gopressBodyContext) compileForPost(stmt string) (string, bool) {
+	lines, ok := c.compileAssignment(stmt)
+	if !ok || len(lines) != 1 {
+		return "", false
+	}
+	return lines[0], true
 }
 
-func compileGopressVarDecl(stmt string, forClause bool) (string, bool) {
+func (c *gopressBodyContext) compileVarDecl(stmt string, forClause bool) ([]string, bool) {
 	stmt = strings.TrimSpace(stmt)
 	keyword := ""
 	for _, candidate := range []string{"const", "let", "var"} {
@@ -730,32 +798,37 @@ func compileGopressVarDecl(stmt string, forClause bool) (string, bool) {
 		}
 	}
 	if keyword == "" {
-		return "", false
+		return nil, false
 	}
 	namePart, expr, hasValue := strings.Cut(stmt, "=")
 	if !hasValue {
-		return "", false
+		return nil, false
 	}
 	name, _, _ := strings.Cut(strings.TrimSpace(namePart), ":")
 	name = strings.TrimSpace(strings.TrimSuffix(name, "?"))
 	if name == "" {
-		return "", false
+		return nil, false
 	}
 	expr = strings.TrimSpace(expr)
-	compiled := compileGopressExpr(expr)
+	if c.builders[name] && !forClause {
+		lines := []string{fmt.Sprintf("var %s strings.Builder", name)}
+		lines = append(lines, c.compileBuilderAppend(name, expr)...)
+		return lines, true
+	}
+	compiled := c.compileExpr(expr)
 	if (keyword == "let" || keyword == "var" || forClause) && isIntegerLiteral(expr) {
 		compiled = expr + ".0"
 	}
 	if keyword == "const" && !forClause && isGopressConstLiteral(expr) {
-		return fmt.Sprintf("const %s = %s", name, compiled), true
+		return []string{fmt.Sprintf("const %s = %s", name, compiled)}, true
 	}
-	return fmt.Sprintf("%s := %s", name, compiled), true
+	return []string{fmt.Sprintf("%s := %s", name, compiled)}, true
 }
 
-func compileGopressAssignment(stmt string) (string, bool) {
+func (c *gopressBodyContext) compileAssignment(stmt string) ([]string, bool) {
 	stmt = strings.TrimSpace(stmt)
 	if regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\+\+|--)$`).MatchString(stmt) {
-		return stmt, true
+		return []string{stmt}, true
 	}
 	for _, op := range []string{"+=", "-=", "*=", "/=", "="} {
 		idx := strings.Index(stmt, op)
@@ -768,11 +841,14 @@ func compileGopressAssignment(stmt string) (string, bool) {
 		left := strings.TrimSpace(stmt[:idx])
 		right := strings.TrimSpace(stmt[idx+len(op):])
 		if !regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]+\])?$`).MatchString(left) || right == "" {
-			return "", false
+			return nil, false
 		}
-		return fmt.Sprintf("%s %s %s", left, op, compileGopressExpr(right)), true
+		if c.builders[left] && op == "+=" {
+			return c.compileBuilderAppend(left, right), true
+		}
+		return []string{fmt.Sprintf("%s %s %s", left, op, c.compileExpr(right))}, true
 	}
-	return "", false
+	return nil, false
 }
 
 func unsupportedGopressStatement(path string, stmt string) diagnostics.Diagnostic {
@@ -783,32 +859,66 @@ func unsupportedGopressStatement(path string, stmt string) diagnostics.Diagnosti
 	return diagnostics.Errorf(path, diagnostics.Position{Line: 1, Column: 1}, "GODE_SUBSET_001", "unsupported gopress statement %q", stmt)
 }
 
-func compileGopressExpr(expr string) string {
+func (c *gopressBodyContext) compileBuilderAppend(name string, expr string) []string {
+	parts := splitTopLevelPlus(expr)
+	lines := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("%s.WriteString(%s)", name, c.compileStringPart(part)))
+	}
+	return lines
+}
+
+func (c *gopressBodyContext) compileStringPart(expr string) string {
+	expr = strings.TrimSpace(expr)
+	if isStringLiteral(expr) {
+		return expr
+	}
+	if c.builders[expr] {
+		return expr + ".String()"
+	}
+	if strings.HasPrefix(expr, "req.") {
+		return c.compileExpr(expr)
+	}
+	if expr == "true" || expr == "false" {
+		c.emit.addImport("strconv")
+		return "strconv.FormatBool(" + expr + ")"
+	}
+	c.emit.addImport("strconv")
+	return "strconv.FormatFloat(" + c.compileExpr(expr) + ", 'f', -1, 64)"
+}
+
+func (c *gopressBodyContext) compileExpr(expr string) string {
 	expr = strings.TrimSpace(strings.TrimSuffix(expr, ";"))
 	expr = strings.ReplaceAll(expr, "===", "==")
 	expr = strings.ReplaceAll(expr, "!==", "!=")
 	if expr == "performance.now()" {
+		c.emit.addImport("time")
 		return "time.Now()"
 	}
 	if match := regexp.MustCompile(`^performance\.now\(\)\s*-\s*([A-Za-z_][A-Za-z0-9_]*)$`).FindStringSubmatch(expr); len(match) == 2 {
+		c.emit.addImport("time")
 		return fmt.Sprintf("float64(time.Since(%s).Microseconds()) / 1000.0", match[1])
 	}
 	if strings.HasPrefix(expr, "next(") {
 		return expr
 	}
 	if strings.HasPrefix(expr, "res.") {
-		return compileResponseChain(expr)
+		return c.compileResponseChain(expr)
 	}
 	if strings.HasPrefix(expr, "{") {
-		return compileObjectLiteral(expr)
+		return c.compileObjectLiteral(expr)
 	}
 	if strings.HasPrefix(expr, "req.") {
 		return compileRequestMember(expr)
 	}
-	return replaceRequestMembers(expr)
+	return c.replaceBuilderRefs(replaceRequestMembers(expr))
 }
 
-func compileResponseChain(expr string) string {
+func (c *gopressBodyContext) compileResponseChain(expr string) string {
 	replacements := map[string]string{
 		".status(":     ".Status(",
 		".send(":       ".Send(",
@@ -825,11 +935,12 @@ func compileResponseChain(expr string) string {
 		out = strings.ReplaceAll(out, from, to)
 	}
 	out = replaceRequestMembers(out)
-	out = replaceObjectArgs(out)
+	out = c.replaceObjectArgs(out)
+	out = c.replaceBuilderRefs(out)
 	return out
 }
 
-func replaceObjectArgs(expr string) string {
+func (c *gopressBodyContext) replaceObjectArgs(expr string) string {
 	for {
 		idx := strings.Index(expr, "({")
 		if idx < 0 {
@@ -840,11 +951,11 @@ func replaceObjectArgs(expr string) string {
 		if close < 0 {
 			return expr
 		}
-		expr = expr[:open] + compileObjectLiteral(expr[open:close+1]) + expr[close+1:]
+		expr = expr[:open] + c.compileObjectLiteral(expr[open:close+1]) + expr[close+1:]
 	}
 }
 
-func compileObjectLiteral(expr string) string {
+func (c *gopressBodyContext) compileObjectLiteral(expr string) string {
 	body := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(expr), "{"), "}"))
 	if body == "" {
 		return "map[string]any{}"
@@ -863,20 +974,20 @@ func compileObjectLiteral(expr string) string {
 		part = strings.TrimSpace(part)
 		if strings.HasPrefix(part, "...") {
 			flushEntries()
-			maps = append(maps, compileGopressExpr(strings.TrimSpace(strings.TrimPrefix(part, "..."))))
+			maps = append(maps, c.compileExpr(strings.TrimSpace(strings.TrimPrefix(part, "..."))))
 			continue
 		}
 		if idx := findTopLevelColon(part); idx >= 0 {
 			key := strings.Trim(strings.TrimSpace(part[:idx]), `"'`)
 			value := strings.TrimSpace(part[idx+1:])
-			entries = append(entries, fmt.Sprintf("%q: %s", key, compileGopressExpr(value)))
+			entries = append(entries, fmt.Sprintf("%q: %s", key, c.compileExpr(value)))
 			continue
 		}
 		key := strings.Trim(strings.TrimSpace(part), `"'`)
 		if key == "" {
 			continue
 		}
-		entries = append(entries, fmt.Sprintf("%q: %s", key, compileGopressExpr(part)))
+		entries = append(entries, fmt.Sprintf("%q: %s", key, c.compileExpr(part)))
 	}
 	flushEntries()
 	if len(maps) == 0 {
@@ -885,7 +996,18 @@ func compileObjectLiteral(expr string) string {
 	if len(maps) == 1 {
 		return maps[0]
 	}
+	c.emit.needsMergeJSON = true
 	return "godeMergeJSON(" + strings.Join(maps, ", ") + ")"
+}
+
+func (c *gopressBodyContext) replaceBuilderRefs(expr string) string {
+	for name := range c.builders {
+		re := regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\b`)
+		expr = re.ReplaceAllStringFunc(expr, func(match string) string {
+			return match + ".String()"
+		})
+	}
+	return expr
 }
 
 func compileRequestMember(expr string) string {
@@ -915,6 +1037,19 @@ func replaceRequestMembers(expr string) string {
 	expr = strings.ReplaceAll(expr, "req.method", "req.Method")
 	expr = strings.ReplaceAll(expr, "req.path", "req.Path")
 	return expr
+}
+
+func discoverStringBuilderVars(body string) map[string]bool {
+	out := map[string]bool{}
+	re := regexp.MustCompile(`(?:^|[\s;{}])(?:let|var)\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s*:\s*string)?\s*=\s*(['"])`)
+	for _, match := range re.FindAllStringSubmatch(body, -1) {
+		name := match[1]
+		mutates := regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\s*\+=`).MatchString(body)
+		if mutates {
+			out[name] = true
+		}
+	}
+	return out
 }
 
 func zeroReturnStatement(goType string) string {
@@ -1042,6 +1177,55 @@ func splitTopLevelSemicolons(src string) []string {
 		}
 	}
 	out = append(out, strings.TrimSpace(current.String()))
+	return out
+}
+
+func splitTopLevelPlus(src string) []string {
+	var out []string
+	var current strings.Builder
+	depth := 0
+	inString := rune(0)
+	escaped := false
+	for _, r := range src {
+		if inString != 0 {
+			current.WriteRune(r)
+			if escaped {
+				escaped = false
+				continue
+			}
+			if r == '\\' {
+				escaped = true
+				continue
+			}
+			if r == inString {
+				inString = 0
+			}
+			continue
+		}
+		switch r {
+		case '\'', '"':
+			inString = r
+			current.WriteRune(r)
+		case '(', '{', '[':
+			depth++
+			current.WriteRune(r)
+		case ')', '}', ']':
+			depth--
+			current.WriteRune(r)
+		case '+':
+			if depth == 0 {
+				out = append(out, strings.TrimSpace(current.String()))
+				current.Reset()
+			} else {
+				current.WriteRune(r)
+			}
+		default:
+			current.WriteRune(r)
+		}
+	}
+	if strings.TrimSpace(current.String()) != "" {
+		out = append(out, strings.TrimSpace(current.String()))
+	}
 	return out
 }
 
