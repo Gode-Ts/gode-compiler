@@ -14,6 +14,7 @@ type Config struct {
 	NumberMode  string `json:"numberMode"`
 	Strict      bool   `json:"strict"`
 	EmitOnError bool   `json:"emitOnError"`
+	Framework   string `json:"framework"`
 }
 
 func Default() Config {
@@ -53,6 +54,13 @@ func (c Config) WithPackage(name string) Config {
 func (c Config) WithOut(out string) Config {
 	if out != "" {
 		c.Out = out
+	}
+	return c
+}
+
+func (c Config) WithFramework(framework string) Config {
+	if framework != "" {
+		c.Framework = framework
 	}
 	return c
 }

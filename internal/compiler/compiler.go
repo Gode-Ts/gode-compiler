@@ -19,10 +19,14 @@ import (
 type Result struct {
 	IR          ir.Module
 	Go          string
+	Metadata    string
 	Diagnostics diagnostics.List
 }
 
 func CompileFile(path string, src []byte, cfg config.Config) Result {
+	if isGopressSource(src, cfg) {
+		return CompileGopress(path, src, cfg)
+	}
 	mod, diags := parser.ParseFile(path, src)
 	if diags.HasErrors() {
 		return Result{Diagnostics: diags}
@@ -41,6 +45,18 @@ func CompileDir(path string, cfg config.Config) Result {
 	files, err := collectTSFiles(path)
 	if err != nil {
 		return Result{Diagnostics: diagnostics.List{diagnostics.Errorf(path, diagnostics.Position{Line: 1, Column: 1}, "GODE_PARSE_001", "%s", err)}}
+	}
+	if cfg.Framework == "gopress" {
+		var combined []byte
+		for _, file := range files {
+			src, err := os.ReadFile(file)
+			if err != nil {
+				return Result{Diagnostics: diagnostics.List{diagnostics.Errorf(file, diagnostics.Position{Line: 1, Column: 1}, "GODE_PARSE_001", "%s", err)}}
+			}
+			combined = append(combined, src...)
+			combined = append(combined, '\n')
+		}
+		return CompileGopress(path, combined, cfg)
 	}
 	var combined fast.Module
 	for _, file := range files {

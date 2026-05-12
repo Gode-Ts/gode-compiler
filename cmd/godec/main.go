@@ -88,6 +88,12 @@ func runCompileLike(args []string, stdout, stderr io.Writer, emit bool) int {
 		fmt.Fprintf(stderr, "failed to write output: %v\n", err)
 		return 1
 	}
+	if result.Metadata != "" {
+		if err := os.WriteFile(filepath.Join(cfg.Out, "gode_routes.json"), []byte(result.Metadata), 0o644); err != nil {
+			fmt.Fprintf(stderr, "failed to write route metadata: %v\n", err)
+			return 1
+		}
+	}
 	return 0
 }
 

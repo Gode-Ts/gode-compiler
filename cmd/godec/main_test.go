@@ -60,3 +60,42 @@ export type User = {
 		t.Fatalf("expected generated struct, got:\n%s", got)
 	}
 }
+
+func TestRunCompileWritesGopressRouteMetadata(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	out := filepath.Join(dir, "gen")
+	cfg := filepath.Join(dir, "gode.json")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfg, []byte(`{"framework":"gopress","entry":"./src","package":"main"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "app.ts"), []byte(`
+import gopress from "gopress"
+const app = gopress()
+app.get("/users/:id", async (req, res) => {
+  return res.send(req.params.id)
+})
+export default app
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr strings.Builder
+	code := run([]string{"compile", src, "--config", cfg, "--out", out, "--package", "main"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("expected exit code 0, got %d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+
+	got, err := os.ReadFile(filepath.Join(out, "gode_routes.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"framework": "gopress"`, `"method": "GET"`, `"path": "/users/:id"`} {
+		if !strings.Contains(string(got), want) {
+			t.Fatalf("metadata missing %q:\n%s", want, got)
+		}
+	}
+}
