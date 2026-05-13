@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"go/format"
+	"net/http"
 	"regexp"
 	"sort"
 	"strconv"
@@ -1141,7 +1142,7 @@ func canCompileRawParamHandler(src string) bool {
 	if !rawRequestUsageSupported(trimmed, true) {
 		return false
 	}
-	for _, unsupported := range []string{"req.body", "res.set(", "res.cookie(", "res.redirect(", "res.sendFile(", "res.sendStatus("} {
+	for _, unsupported := range []string{"req.body", "res.set(", "res.cookie(", "res.sendFile(", "res.sendStatus("} {
 		if strings.Contains(trimmed, unsupported) {
 			return false
 		}
@@ -1182,7 +1183,7 @@ func canCompileRawHandler(src string) bool {
 	if !rawRequestUsageSupported(trimmed, false) {
 		return false
 	}
-	for _, unsupported := range []string{"res.set(", "res.cookie(", "res.redirect(", "res.sendFile(", "res.sendStatus("} {
+	for _, unsupported := range []string{"res.set(", "res.cookie(", "res.sendFile(", "res.sendStatus("} {
 		if strings.Contains(trimmed, unsupported) {
 			return false
 		}
@@ -1851,6 +1852,12 @@ func (c *gopressBodyContext) compileResponseChain(expr string) string {
 
 func (c *gopressBodyContext) compileRawResponseStatement(expr string) ([]string, bool) {
 	expr = strings.TrimSpace(expr)
+	if status, location, ok := parseResponseRedirectCall(expr); ok {
+		return []string{
+			`w.Header().Set("Location", ` + c.compileExpr(location) + ")",
+			`return gopress.WriteRawString(w, ` + status + `, "text/plain", ` + redirectStatusTextExpr(status) + ")",
+		}, true
+	}
 	if status, name, ok := parseResponseJSONTypeSend(expr); ok {
 		switch {
 		case c.byteBuffers[name] > 0:
@@ -1873,6 +1880,40 @@ func (c *gopressBodyContext) compileRawResponseStatement(expr string) ([]string,
 		return []string{"return gopress.WriteJSON(w, " + status + ", " + c.compileExpr(arg) + ")"}, true
 	}
 	return nil, false
+}
+
+func parseResponseRedirectCall(expr string) (string, string, bool) {
+	status := "302"
+	rest := strings.TrimSpace(expr)
+	if strings.HasPrefix(rest, "res.status(") {
+		open := strings.IndexByte(rest, '(')
+		close := findMatching(rest, open, '(', ')')
+		if close < 0 {
+			return "", "", false
+		}
+		status = strings.TrimSpace(rest[open+1 : close])
+		rest = "res" + strings.TrimSpace(rest[close+1:])
+	}
+	args, ok := callArgs(rest, "res.redirect")
+	if !ok {
+		return "", "", false
+	}
+	switch len(args) {
+	case 1:
+		return status, args[0], true
+	case 2:
+		return strings.TrimSpace(args[0]), args[1], true
+	default:
+		return "", "", false
+	}
+}
+
+func redirectStatusTextExpr(status string) string {
+	status = strings.TrimSpace(status)
+	if value, err := strconv.Atoi(status); err == nil {
+		return strconv.Quote(http.StatusText(value))
+	}
+	return "http.StatusText(" + status + ")"
 }
 
 func parseResponseJSONTypeSend(expr string) (string, string, bool) {

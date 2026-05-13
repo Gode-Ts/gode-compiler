@@ -220,8 +220,9 @@ export default app
 		`app.Use("/users", users)`,
 		`app.UseError(func(err error, req *gopress.Request, res *gopress.Response, next gopress.NextFunc) error {`,
 		`return res.Status(500).Send("error")`,
-		`app.HandleFastOptions("GET", "/go", gopress.FastRequestOptions{}, func(req *gopress.Request, res *gopress.Response) error {`,
-		`return res.Redirect("/users/1")`,
+		`app.HandleRaw("GET", "/go", func(w http.ResponseWriter, request *http.Request) error {`,
+		`w.Header().Set("Location", "/users/1")`,
+		`return gopress.WriteRawString(w, 302, "text/plain", "Found")`,
 	} {
 		if !strings.Contains(result.Go, want) {
 			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
@@ -231,6 +232,8 @@ export default app
 		`users.HandleFastOptions("GET", "/:id"`,
 		`req.Param("id")`,
 		`res.Type("text/plain").Send`,
+		`app.HandleFastOptions("GET", "/go"`,
+		`res.Redirect("/users/1")`,
 	} {
 		if strings.Contains(result.Go, unwanted) {
 			t.Fatalf("generated Go should not contain %q:\n%s", unwanted, result.Go)
@@ -505,6 +508,42 @@ export default app
 	for _, unwanted := range []string{
 		`res.Status(201).Type("application/json").Send`,
 		`gopress.WriteRawString(w, 201, "application/json"`,
+	} {
+		if strings.Contains(result.Go, unwanted) {
+			t.Fatalf("generated Go should not contain %q:\n%s", unwanted, result.Go)
+		}
+	}
+}
+
+func TestGopressRedirectWithStatusUsesRawHandler(t *testing.T) {
+	src := []byte(`
+import gopress, { Request, Response } from "gopress"
+
+const app = gopress()
+
+app.get("/old", async (req: Request, res: Response) => {
+  return res.redirect(301, "/new")
+})
+
+export default app
+`)
+
+	result := compiler.CompileFile("app.ts", src, config.Default().WithFramework("gopress").WithPackage("main"))
+	if result.Diagnostics.HasErrors() {
+		t.Fatalf("unexpected diagnostics:\n%s", result.Diagnostics.String())
+	}
+	for _, want := range []string{
+		`app.HandleRaw("GET", "/old", func(w http.ResponseWriter, request *http.Request) error {`,
+		`w.Header().Set("Location", "/new")`,
+		`return gopress.WriteRawString(w, 301, "text/plain", "Moved Permanently")`,
+	} {
+		if !strings.Contains(result.Go, want) {
+			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
+		}
+	}
+	for _, unwanted := range []string{
+		`app.HandleFastOptions("GET", "/old"`,
+		`res.Redirect(301, "/new")`,
 	} {
 		if strings.Contains(result.Go, unwanted) {
 			t.Fatalf("generated Go should not contain %q:\n%s", unwanted, result.Go)
