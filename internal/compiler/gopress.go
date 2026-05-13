@@ -1851,6 +1851,9 @@ func (c *gopressBodyContext) compileResponseChain(expr string) string {
 
 func (c *gopressBodyContext) compileRawResponseStatement(expr string) ([]string, bool) {
 	expr = strings.TrimSpace(expr)
+	if status, contentType, arg, ok := parseResponseTextCall(expr); ok {
+		return []string{"return gopress.WriteRawString(w, " + status + ", " + contentType + ", " + c.compileExpr(arg) + ")"}, true
+	}
 	if status, arg, ok := parseResponseJSONCall(expr); ok {
 		if lines, ok := c.compileRawJSONByteResponse(status, arg); ok {
 			return lines, true
@@ -1858,6 +1861,47 @@ func (c *gopressBodyContext) compileRawResponseStatement(expr string) ([]string,
 		return []string{"return gopress.WriteJSON(w, " + status + ", " + c.compileExpr(arg) + ")"}, true
 	}
 	return nil, false
+}
+
+func parseResponseTextCall(expr string) (string, string, string, bool) {
+	expr = strings.TrimSpace(expr)
+	status := "200"
+	rest := expr
+	if strings.HasPrefix(rest, "res.status(") {
+		open := strings.IndexByte(rest, '(')
+		close := findMatching(rest, open, '(', ')')
+		if close < 0 {
+			return "", "", "", false
+		}
+		status = strings.TrimSpace(rest[open+1 : close])
+		rest = "res" + strings.TrimSpace(rest[close+1:])
+	}
+	if strings.HasPrefix(rest, "res.type(") {
+		open := strings.IndexByte(rest, '(')
+		close := findMatching(rest, open, '(', ')')
+		if close < 0 {
+			return "", "", "", false
+		}
+		contentType := strings.TrimSpace(rest[open+1 : close])
+		if !isConcreteRawContentType(contentType) {
+			return "", "", "", false
+		}
+		tail := strings.TrimSpace(rest[close+1:])
+		if !strings.HasPrefix(tail, ".send(") {
+			return "", "", "", false
+		}
+		arg, ok := singleCallArg("res"+tail, "res.send")
+		if !ok {
+			return "", "", "", false
+		}
+		return status, contentType, arg, true
+	}
+	return "", "", "", false
+}
+
+func isConcreteRawContentType(value string) bool {
+	unquoted, err := strconv.Unquote(strings.TrimSpace(value))
+	return err == nil && strings.Contains(unquoted, "/") && !strings.EqualFold(unquoted, "application/json")
 }
 
 func (c *gopressBodyContext) compileResponseJSONByteStatement(expr string) ([]string, bool) {

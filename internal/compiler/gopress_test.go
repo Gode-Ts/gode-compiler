@@ -215,8 +215,8 @@ export default app
 	}
 	for _, want := range []string{
 		"users := gopress.Router()",
-		`users.HandleFastOptions("GET", "/:id", gopress.FastRequestOptions{}, func(req *gopress.Request, res *gopress.Response) error {`,
-		`return res.Type("text/plain").Send(req.Method + ":" + req.Path + ":" + req.Param("id"))`,
+		`users.HandleRawParam("GET", "/:id", "id", func(w http.ResponseWriter, request *http.Request, param string) error {`,
+		`return gopress.WriteRawString(w, 200, "text/plain", request.Method+":"+request.URL.Path+":"+param)`,
 		`app.Use("/users", users)`,
 		`app.UseError(func(err error, req *gopress.Request, res *gopress.Response, next gopress.NextFunc) error {`,
 		`return res.Status(500).Send("error")`,
@@ -225,6 +225,15 @@ export default app
 	} {
 		if !strings.Contains(result.Go, want) {
 			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
+		}
+	}
+	for _, unwanted := range []string{
+		`users.HandleFastOptions("GET", "/:id"`,
+		`req.Param("id")`,
+		`res.Type("text/plain").Send`,
+	} {
+		if strings.Contains(result.Go, unwanted) {
+			t.Fatalf("generated Go should not contain %q:\n%s", unwanted, result.Go)
 		}
 	}
 	for _, want := range []string{`"target": "users"`, `"path": "/users"`, `"path": "/:id"`} {
