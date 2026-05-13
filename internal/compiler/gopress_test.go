@@ -319,7 +319,7 @@ export default app
 	}
 }
 
-func TestGopressKnownObjectJSONUsesByteWriter(t *testing.T) {
+func TestGopressConstObjectJSONUsesRawString(t *testing.T) {
 	src := []byte(`
 import gopress, { Request, Response } from "gopress"
 
@@ -340,14 +340,7 @@ export default app
 	}
 	for _, want := range []string{
 		`app.HandleRaw("GET", "/metrics", func(w http.ResponseWriter, request *http.Request) error {`,
-		`godeJSON := make([]byte, 0, `,
-		`godeJSON = append(godeJSON, "{\"ok\":"...)`,
-		`godeJSON = strconv.AppendBool(godeJSON, true)`,
-		`godeJSON = append(godeJSON, ",\"count\":"...)`,
-		`godeJSON = strconv.AppendInt(godeJSON, int64(count), 10)`,
-		`godeJSON = append(godeJSON, ",\"name\":"...)`,
-		`godeJSON = strconv.AppendQuote(godeJSON, name)`,
-		`return gopress.WriteJSONBytes(w, 201, godeJSON)`,
+		`return gopress.WriteJSONString(w, 201, "{\"ok\":true,\"count\":42,\"name\":\"gode\"}")`,
 	} {
 		if !strings.Contains(result.Go, want) {
 			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
@@ -355,8 +348,11 @@ export default app
 	}
 	for _, unwanted := range []string{
 		"res.StatusJSON(",
+		`make([]byte`,
+		`strconv.Append`,
 		`" + "`,
 		"map[string]any",
+		"gopress.WriteJSONBytes(w, 201",
 		"gopress.WriteJSON(w, 201",
 	} {
 		if strings.Contains(result.Go, unwanted) {
@@ -652,6 +648,46 @@ export default app
 		`gopress.WriteJSON(w, 202`,
 		`json.NewEncoder`,
 		`app.HandleFastOptions("GET", "/status"`,
+	} {
+		if strings.Contains(result.Go, unwanted) {
+			t.Fatalf("generated Go should not contain %q:\n%s", unwanted, result.Go)
+		}
+	}
+}
+
+func TestGopressConstLocalJSONUsesRawString(t *testing.T) {
+	src := []byte(`
+import gopress, { Request, Response } from "gopress"
+
+const app = gopress()
+
+app.get("/info", async (req: Request, res: Response) => {
+  const runtime = "gopress"
+  const ok = true
+  const count = 3
+  return res.status(200).json({ runtime, ok, count })
+})
+
+export default app
+`)
+
+	result := compiler.CompileFile("app.ts", src, config.Default().WithFramework("gopress").WithPackage("main"))
+	if result.Diagnostics.HasErrors() {
+		t.Fatalf("unexpected diagnostics:\n%s", result.Diagnostics.String())
+	}
+	for _, want := range []string{
+		`app.HandleRaw("GET", "/info", func(w http.ResponseWriter, request *http.Request) error {`,
+		`return gopress.WriteJSONString(w, 200, "{\"runtime\":\"gopress\",\"ok\":true,\"count\":3}")`,
+	} {
+		if !strings.Contains(result.Go, want) {
+			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
+		}
+	}
+	for _, unwanted := range []string{
+		`make([]byte`,
+		`strconv.Append`,
+		`gopress.WriteJSONBytes(w, 200`,
+		`gopress.WriteJSON(w, 200`,
 	} {
 		if strings.Contains(result.Go, unwanted) {
 			t.Fatalf("generated Go should not contain %q:\n%s", unwanted, result.Go)

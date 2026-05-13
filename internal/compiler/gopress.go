@@ -84,8 +84,9 @@ type gopressBodyContext struct {
 }
 
 type gopressLocal struct {
-	kind   string
-	object *gopressReturnObject
+	kind      string
+	object    *gopressReturnObject
+	constExpr string
 }
 
 type gopressBodyOptions struct {
@@ -1644,6 +1645,9 @@ func (c *gopressBodyContext) compileVarDecl(stmt string, forClause bool) ([]stri
 		local.kind = "object"
 		local.object = shape
 	}
+	if keyword == "const" && !forClause && isGopressConstLiteral(expr) {
+		local.constExpr = expr
+	}
 	c.locals[name] = local
 	if keyword == "const" && !forClause && isGopressConstLiteral(expr) {
 		return []string{fmt.Sprintf("const %s = %s", name, compiled)}, true
@@ -2006,7 +2010,7 @@ func (c *gopressBodyContext) compileResponseJSONByteStatement(expr string) ([]st
 	if !ok {
 		return nil, false
 	}
-	if raw, ok := compileStaticJSON(arg); ok {
+	if raw, ok := c.compileStaticJSON(arg); ok {
 		return []string{"return res.Status(" + status + ").JSONString(" + raw + ")"}, true
 	}
 	fields, ok := c.flattenJSONFields(arg)
@@ -2050,7 +2054,7 @@ func parseResponseJSONCall(expr string) (string, string, bool) {
 }
 
 func (c *gopressBodyContext) compileRawJSONByteResponse(status string, expr string) ([]string, bool) {
-	if raw, ok := compileStaticJSON(expr); ok {
+	if raw, ok := c.compileStaticJSON(expr); ok {
 		return []string{"return gopress.WriteJSONString(w, " + status + ", " + raw + ")"}, true
 	}
 	fields, ok := c.flattenJSONFields(expr)
@@ -2063,19 +2067,19 @@ func (c *gopressBodyContext) compileRawJSONByteResponse(status string, expr stri
 	return lines, true
 }
 
-func compileStaticJSON(expr string) (string, bool) {
-	if raw, ok := compileStaticJSONLiteral(expr); ok {
+func (c *gopressBodyContext) compileStaticJSON(expr string) (string, bool) {
+	if raw, ok := c.compileStaticJSONLiteral(expr); ok {
 		return raw, true
 	}
-	value, ok := staticJSONValue(expr)
+	value, ok := c.staticJSONValue(expr)
 	if !ok {
 		return "", false
 	}
 	return strconv.Quote(value), true
 }
 
-func compileStaticJSONLiteral(expr string) (string, bool) {
-	if !couldBeStaticJSONLiteral(expr) {
+func (c *gopressBodyContext) compileStaticJSONLiteral(expr string) (string, bool) {
+	if !c.couldBeStaticJSONLiteral(expr) {
 		return "", false
 	}
 	fields, ok := parseGopressObjectFields(expr)
@@ -2088,7 +2092,7 @@ func compileStaticJSONLiteral(expr string) (string, bool) {
 		if field.Dynamic {
 			return "", false
 		}
-		value, ok := staticJSONValue(field.Expr)
+		value, ok := c.staticJSONValue(field.Expr)
 		if !ok {
 			return "", false
 		}
@@ -2107,9 +2111,12 @@ func compileStaticJSONLiteral(expr string) (string, bool) {
 	return strconv.Quote(out.String()), true
 }
 
-func couldBeStaticJSONLiteral(expr string) bool {
+func (c *gopressBodyContext) couldBeStaticJSONLiteral(expr string) bool {
 	expr = strings.TrimSpace(expr)
 	if !strings.HasPrefix(expr, "{") {
+		return false
+	}
+	if strings.Contains(expr, "...") {
 		return false
 	}
 	close := findMatching(expr, 0, '{', '}')
@@ -2118,16 +2125,22 @@ func couldBeStaticJSONLiteral(expr string) bool {
 	}
 	pos := skipSpace(expr, 1)
 	for pos < close {
-		colon := findTopLevelColon(expr[pos:close])
-		if colon < 0 {
+		fieldEnd := staticJSONFieldEnd(expr, pos, close)
+		if fieldEnd <= pos {
 			return false
 		}
-		valueStart := skipSpace(expr, pos+colon+1)
-		valueEnd, ok := staticJSONValueEnd(expr, valueStart, close)
-		if !ok {
+		field := strings.TrimSpace(expr[pos:fieldEnd])
+		if field == "" || strings.HasPrefix(field, "...") {
 			return false
 		}
-		pos = skipSpace(expr, valueEnd)
+		value := field
+		if colon := findTopLevelColon(field); colon >= 0 {
+			value = strings.TrimSpace(field[colon+1:])
+		}
+		if !c.isStaticJSONValueCandidate(value) {
+			return false
+		}
+		pos = skipSpace(expr, fieldEnd)
 		if pos == close {
 			return true
 		}
@@ -2139,74 +2152,70 @@ func couldBeStaticJSONLiteral(expr string) bool {
 	return true
 }
 
-func staticJSONValueEnd(expr string, pos int, limit int) (int, bool) {
-	if pos >= limit {
-		return pos, false
+func (c *gopressBodyContext) isStaticJSONValueCandidate(expr string) bool {
+	expr = strings.TrimSpace(expr)
+	if local, ok := c.locals[expr]; ok && local.constExpr != "" {
+		return true
 	}
-	switch expr[pos] {
-	case '"', '\'':
-		return staticJSONStringEnd(expr, pos, limit)
-	case 't':
-		return staticJSONKeywordEnd(expr, pos, limit, "true")
-	case 'f':
-		return staticJSONKeywordEnd(expr, pos, limit, "false")
-	case 'n':
-		return staticJSONKeywordEnd(expr, pos, limit, "null")
-	default:
-		return staticJSONNumberEnd(expr, pos, limit)
-	}
+	return isStringLiteral(expr) ||
+		expr == "true" ||
+		expr == "false" ||
+		expr == "null" ||
+		isIntegerLiteral(expr) ||
+		isDecimalLiteral(expr)
 }
 
-func staticJSONStringEnd(expr string, pos int, limit int) (int, bool) {
-	quote := expr[pos]
+func staticJSONFieldEnd(expr string, pos int, limit int) int {
+	depth := 0
+	inString := byte(0)
 	escaped := false
-	for pos++; pos < limit; pos++ {
-		ch := expr[pos]
-		if escaped {
-			escaped = false
-			continue
-		}
-		if ch == '\\' {
-			escaped = true
-			continue
-		}
-		if ch == quote {
-			return pos + 1, true
-		}
-	}
-	return pos, false
-}
-
-func staticJSONKeywordEnd(expr string, pos int, limit int, keyword string) (int, bool) {
-	end := pos + len(keyword)
-	if end > limit || expr[pos:end] != keyword {
-		return pos, false
-	}
-	return end, true
-}
-
-func staticJSONNumberEnd(expr string, pos int, limit int) (int, bool) {
-	if expr[pos] == '-' {
-		pos++
-	}
-	start := pos
-	dot := false
 	for pos < limit {
 		ch := expr[pos]
-		switch {
-		case ch >= '0' && ch <= '9':
+		if inString != 0 {
+			if escaped {
+				escaped = false
+				pos++
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				pos++
+				continue
+			}
+			if ch == inString {
+				inString = 0
+			}
 			pos++
-		case ch == '.' && !dot:
-			dot = true
-			pos++
-		default:
-			return pos, pos > start
+			continue
 		}
+		switch ch {
+		case '"', '\'':
+			inString = ch
+		case '{', '[', '(':
+			depth++
+		case '}', ']', ')':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				return pos
+			}
+		}
+		pos++
 	}
-	return pos, pos > start
+	return limit
 }
 
-func staticJSONValue(expr string) (string, bool) {
+func (c *gopressBodyContext) staticJSONValue(expr string) (string, bool) {
+	expr = strings.TrimSpace(expr)
+	if local, ok := c.locals[expr]; ok && local.constExpr != "" {
+		return staticJSONLiteralValue(local.constExpr)
+	}
+	return staticJSONLiteralValue(expr)
+}
+
+func staticJSONLiteralValue(expr string) (string, bool) {
 	expr = strings.TrimSpace(expr)
 	switch {
 	case isStringLiteral(expr):
