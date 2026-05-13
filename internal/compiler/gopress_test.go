@@ -817,7 +817,7 @@ func TestGopressCompilerAvoidsRegexAllocationChurn(t *testing.T) {
 			t.Fatalf("unexpected diagnostics:\n%s", result.Diagnostics.String())
 		}
 	})
-	if allocs > 1250 {
-		t.Fatalf("gopress compiler allocations too high: got %.0f allocs/run, want <= 1250", allocs)
+	if allocs > 1210 {
+		t.Fatalf("gopress compiler allocations too high: got %.0f allocs/run, want <= 1210", allocs)
 	}
 }

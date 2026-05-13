@@ -57,9 +57,20 @@ type gopressCall struct {
 }
 
 type gopressEmitContext struct {
-	imports        map[string]bool
+	imports        gopressImportSet
+	extraImports   map[string]bool
 	needsMergeJSON bool
 }
+
+type gopressImportSet uint8
+
+const (
+	gopressImportRuntime gopressImportSet = 1 << iota
+	gopressImportNetHTTP
+	gopressImportStrconv
+	gopressImportStrings
+	gopressImportTime
+)
 
 type gopressRenderedFunc struct {
 	Header     string
@@ -141,17 +152,18 @@ type gopressMountMetadataRow struct {
 }
 
 var (
-	gopressAppVarRE        = regexp.MustCompile(`const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(gopress|Router)\s*\(\s*\)`)
-	gopressHandlerRE       = regexp.MustCompile(`export\s+(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*:\s*Promise<[^>]+>\s*\{`)
-	gopressHelperRE        = regexp.MustCompile(`(?:^|[;\n])\s*(?:export\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*(?::\s*([A-Za-z_][A-Za-z0-9_<>\[\]\s|]*))?\s*\{`)
-	gopressFunctionSpanRE  = regexp.MustCompile(`(?:^|[;\n])\s*(?:export\s+)?(?:async\s+)?function\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)\s*(?::\s*[A-Za-z_][A-Za-z0-9_<>\[\]\s|]*)?\s*\{`)
-	gopressReturnObjectRE  = regexp.MustCompile(`\breturn\s*\{`)
-	gopressBuilderVarRE    = regexp.MustCompile(`(?:^|[\s;{}])(?:let|var)\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s*:\s*string)?\s*=\s*(['"])`)
-	gopressRequestMemberRE = regexp.MustCompile(`req\.(params|query|body|headers|cookies)\.([A-Za-z_][A-Za-z0-9_]*)`)
+	gopressImportDouble = []byte(`from "gopress"`)
+	gopressImportSingle = []byte(`from 'gopress'`)
+
+	gopressAppVarRE       = regexp.MustCompile(`const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(gopress|Router)\s*\(\s*\)`)
+	gopressHandlerRE      = regexp.MustCompile(`export\s+(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*:\s*Promise<[^>]+>\s*\{`)
+	gopressHelperRE       = regexp.MustCompile(`(?:^|[;\n])\s*(?:export\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*(?::\s*([A-Za-z_][A-Za-z0-9_<>\[\]\s|]*))?\s*\{`)
+	gopressFunctionSpanRE = regexp.MustCompile(`(?:^|[;\n])\s*(?:export\s+)?(?:async\s+)?function\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)\s*(?::\s*[A-Za-z_][A-Za-z0-9_<>\[\]\s|]*)?\s*\{`)
+	gopressReturnObjectRE = regexp.MustCompile(`\breturn\s*\{`)
 )
 
 func isGopressSource(src []byte, cfg config.Config) bool {
-	return cfg.Framework == "gopress" || strings.Contains(string(src), `from "gopress"`) || strings.Contains(string(src), `from 'gopress'`)
+	return cfg.Framework == "gopress" || bytes.Contains(src, gopressImportDouble) || bytes.Contains(src, gopressImportSingle)
 }
 
 func CompileGopress(path string, src []byte, cfg config.Config) Result {
@@ -774,7 +786,8 @@ func (a *gopressApp) emit() (string, diagnostics.List) {
 }
 
 func (a *gopressApp) routeMetadata() string {
-	metadata := gopressRouteMetadata{Framework: "gopress", Routes: []gopressRouteMetadataRow{}, Mounts: []gopressMountMetadataRow{}}
+	routes := make([]gopressRouteMetadataRow, 0, len(a.calls))
+	var mounts []gopressMountMetadataRow
 	for _, call := range a.calls {
 		method := strings.ToLower(call.Method)
 		switch {
@@ -782,38 +795,124 @@ func (a *gopressApp) routeMetadata() string {
 			for _, arg := range call.Args[1:] {
 				target := strings.TrimSpace(arg)
 				if _, ok := a.vars[target]; ok {
-					metadata.Mounts = append(metadata.Mounts, gopressMountMetadataRow{Receiver: call.Receiver, Path: metadataPath(call.Args[0]), Target: target})
+					mounts = append(mounts, gopressMountMetadataRow{Receiver: call.Receiver, Path: metadataPath(call.Args[0]), Target: target})
 				}
 			}
 		case isRouteMethod(method) && len(call.Args) >= 1:
-			metadata.Routes = append(metadata.Routes, gopressRouteMetadataRow{Receiver: call.Receiver, Method: strings.ToUpper(method), Path: metadataPath(call.Args[0])})
+			routes = append(routes, gopressRouteMetadataRow{Receiver: call.Receiver, Method: gopressHTTPMethod(method), Path: metadataPath(call.Args[0])})
 		case strings.HasPrefix(method, "route.") && len(call.Args) >= 1:
-			metadata.Routes = append(metadata.Routes, gopressRouteMetadataRow{Receiver: call.Receiver, Method: strings.ToUpper(strings.TrimPrefix(method, "route.")), Path: metadataPath(call.Args[0])})
+			routes = append(routes, gopressRouteMetadataRow{Receiver: call.Receiver, Method: gopressHTTPMethod(strings.TrimPrefix(method, "route.")), Path: metadataPath(call.Args[0])})
 		}
 	}
-	sort.SliceStable(metadata.Routes, func(i, j int) bool {
-		if metadata.Routes[i].Receiver != metadata.Routes[j].Receiver {
-			return metadata.Routes[i].Receiver < metadata.Routes[j].Receiver
+	sort.SliceStable(routes, func(i, j int) bool {
+		if routes[i].Receiver != routes[j].Receiver {
+			return routes[i].Receiver < routes[j].Receiver
 		}
-		if metadata.Routes[i].Path != metadata.Routes[j].Path {
-			return metadata.Routes[i].Path < metadata.Routes[j].Path
+		if routes[i].Path != routes[j].Path {
+			return routes[i].Path < routes[j].Path
 		}
-		return metadata.Routes[i].Method < metadata.Routes[j].Method
+		return routes[i].Method < routes[j].Method
 	})
-	sort.SliceStable(metadata.Mounts, func(i, j int) bool {
-		if metadata.Mounts[i].Receiver != metadata.Mounts[j].Receiver {
-			return metadata.Mounts[i].Receiver < metadata.Mounts[j].Receiver
+	sort.SliceStable(mounts, func(i, j int) bool {
+		if mounts[i].Receiver != mounts[j].Receiver {
+			return mounts[i].Receiver < mounts[j].Receiver
 		}
-		if metadata.Mounts[i].Path != metadata.Mounts[j].Path {
-			return metadata.Mounts[i].Path < metadata.Mounts[j].Path
+		if mounts[i].Path != mounts[j].Path {
+			return mounts[i].Path < mounts[j].Path
 		}
-		return metadata.Mounts[i].Target < metadata.Mounts[j].Target
+		return mounts[i].Target < mounts[j].Target
 	})
-	data, err := json.MarshalIndent(metadata, "", "  ")
-	if err != nil {
-		return ""
+
+	out := make([]byte, 0, 96+len(routes)*96+len(mounts)*96)
+	out = append(out, "{\n"...)
+	out = appendMetadataStringField(out, "  ", "framework", "gopress", true)
+	out = append(out, `  "routes": `...)
+	out = appendRouteMetadataRows(out, routes, true)
+	out = append(out, `  "mounts": `...)
+	out = appendMountMetadataRows(out, mounts)
+	out = append(out, "}\n"...)
+	return string(out)
+}
+
+func appendRouteMetadataRows(out []byte, routes []gopressRouteMetadataRow, comma bool) []byte {
+	if len(routes) == 0 {
+		out = append(out, "[]"...)
+		if comma {
+			out = append(out, ',')
+		}
+		return append(out, '\n')
 	}
-	return string(data) + "\n"
+	out = append(out, "[\n"...)
+	for idx, route := range routes {
+		out = append(out, "    {\n"...)
+		out = appendMetadataStringField(out, "      ", "receiver", route.Receiver, true)
+		out = appendMetadataStringField(out, "      ", "method", route.Method, true)
+		out = appendMetadataStringField(out, "      ", "path", route.Path, false)
+		out = append(out, "    }"...)
+		if idx < len(routes)-1 {
+			out = append(out, ',')
+		}
+		out = append(out, '\n')
+	}
+	out = append(out, "  ]"...)
+	if comma {
+		out = append(out, ',')
+	}
+	return append(out, '\n')
+}
+
+func appendMountMetadataRows(out []byte, mounts []gopressMountMetadataRow) []byte {
+	if len(mounts) == 0 {
+		return append(out, "[]\n"...)
+	}
+	out = append(out, "[\n"...)
+	for idx, mount := range mounts {
+		out = append(out, "    {\n"...)
+		out = appendMetadataStringField(out, "      ", "receiver", mount.Receiver, true)
+		out = appendMetadataStringField(out, "      ", "path", mount.Path, true)
+		out = appendMetadataStringField(out, "      ", "target", mount.Target, false)
+		out = append(out, "    }"...)
+		if idx < len(mounts)-1 {
+			out = append(out, ',')
+		}
+		out = append(out, '\n')
+	}
+	return append(out, "  ]\n"...)
+}
+
+func appendMetadataStringField(out []byte, indent string, name string, value string, comma bool) []byte {
+	out = append(out, indent...)
+	out = append(out, '"')
+	out = append(out, name...)
+	out = append(out, `": `...)
+	out = strconv.AppendQuote(out, value)
+	if comma {
+		out = append(out, ',')
+	}
+	return append(out, '\n')
+}
+
+func gopressHTTPMethod(method string) string {
+	switch method {
+	case "all":
+		return "ALL"
+	case "get":
+		return "GET"
+	case "post":
+		return "POST"
+	case "put":
+		return "PUT"
+	case "patch":
+		return "PATCH"
+	case "delete":
+		return "DELETE"
+	case "options":
+		return "OPTIONS"
+	case "head":
+		return "HEAD"
+	default:
+		return strings.ToUpper(method)
+	}
 }
 
 func metadataPath(value string) string {
@@ -834,16 +933,33 @@ func sortedVars(vars map[string]string) [][2]string {
 }
 
 func newGopressEmitContext() *gopressEmitContext {
-	return &gopressEmitContext{imports: map[string]bool{}}
+	return &gopressEmitContext{}
 }
 
 func (c *gopressEmitContext) addImport(path string) {
-	c.imports[path] = true
+	switch path {
+	case "github.com/Gode-Ts/gopress":
+		c.imports |= gopressImportRuntime
+	case "net/http":
+		c.imports |= gopressImportNetHTTP
+	case "strconv":
+		c.imports |= gopressImportStrconv
+	case "strings":
+		c.imports |= gopressImportStrings
+	case "time":
+		c.imports |= gopressImportTime
+	default:
+		if c.extraImports == nil {
+			c.extraImports = map[string]bool{}
+		}
+		c.extraImports[path] = true
+	}
 }
 
 func (c *gopressEmitContext) merge(other *gopressEmitContext) {
-	for path := range other.imports {
-		c.imports[path] = true
+	c.imports |= other.imports
+	for path := range other.extraImports {
+		c.addImport(path)
 	}
 	if other.needsMergeJSON {
 		c.needsMergeJSON = true
@@ -851,12 +967,39 @@ func (c *gopressEmitContext) merge(other *gopressEmitContext) {
 }
 
 func (c *gopressEmitContext) sortedImports() []string {
-	imports := make([]string, 0, len(c.imports))
-	for path := range c.imports {
-		imports = append(imports, path)
+	imports := make([]string, 0, c.importCount())
+	if c.imports&gopressImportRuntime != 0 {
+		imports = append(imports, "github.com/Gode-Ts/gopress")
 	}
-	sort.Strings(imports)
+	if c.imports&gopressImportNetHTTP != 0 {
+		imports = append(imports, "net/http")
+	}
+	if c.imports&gopressImportStrconv != 0 {
+		imports = append(imports, "strconv")
+	}
+	if c.imports&gopressImportStrings != 0 {
+		imports = append(imports, "strings")
+	}
+	if c.imports&gopressImportTime != 0 {
+		imports = append(imports, "time")
+	}
+	if len(c.extraImports) > 0 {
+		extra := make([]string, 0, len(c.extraImports))
+		for path := range c.extraImports {
+			extra = append(extra, path)
+		}
+		sort.Strings(extra)
+		imports = append(imports, extra...)
+	}
 	return imports
+}
+
+func (c *gopressEmitContext) importCount() int {
+	count := len(c.extraImports)
+	for imports := c.imports; imports != 0; imports &= imports - 1 {
+		count++
+	}
+	return count
 }
 
 func (a *gopressApp) emitGopressCall(ctx *gopressEmitContext, call gopressCall) []string {
@@ -871,20 +1014,20 @@ func (a *gopressApp) emitGopressCall(ctx *gopressEmitContext, call gopressCall) 
 		if len(call.Args) == 2 {
 			if strings.Contains(call.Args[1], "req.params.") {
 				if raw, paramName, ok := a.compileInlineRawSingleParamHandler(ctx, call.Args[1]); ok {
-					return []string{fmt.Sprintf("%s.HandleRawParam(%q, %s, %q, %s)", call.Receiver, strings.ToUpper(method), call.Args[0], paramName, raw)}
+					return []string{fmt.Sprintf("%s.HandleRawParam(%q, %s, %q, %s)", call.Receiver, gopressHTTPMethod(method), call.Args[0], paramName, raw)}
 				}
 				if raw, firstParam, secondParam, ok := a.compileInlineRawTwoParamHandler(ctx, call.Args[0], call.Args[1]); ok {
-					return []string{fmt.Sprintf("%s.HandleRawParams2(%q, %s, %q, %q, %s)", call.Receiver, strings.ToUpper(method), call.Args[0], firstParam, secondParam, raw)}
+					return []string{fmt.Sprintf("%s.HandleRawParams2(%q, %s, %q, %q, %s)", call.Receiver, gopressHTTPMethod(method), call.Args[0], firstParam, secondParam, raw)}
 				}
 				if raw, ok := a.compileInlineRawParamHandler(ctx, call.Args[1]); ok {
-					return []string{fmt.Sprintf("%s.HandleRawParams(%q, %s, %s)", call.Receiver, strings.ToUpper(method), call.Args[0], raw)}
+					return []string{fmt.Sprintf("%s.HandleRawParams(%q, %s, %s)", call.Receiver, gopressHTTPMethod(method), call.Args[0], raw)}
 				}
 			}
 			if raw, ok := a.compileInlineRawHandler(ctx, call.Args[1]); ok {
-				return []string{fmt.Sprintf("%s.HandleRaw(%q, %s, %s)", call.Receiver, strings.ToUpper(method), call.Args[0], raw)}
+				return []string{fmt.Sprintf("%s.HandleRaw(%q, %s, %s)", call.Receiver, gopressHTTPMethod(method), call.Args[0], raw)}
 			}
 			if usage, ok := a.fastHandlerUsage(call.Args[1]); ok {
-				return []string{fmt.Sprintf("%s.HandleFastOptions(%q, %s, %s, %s)", call.Receiver, strings.ToUpper(method), call.Args[0], usage.compileOptions(), a.compileInlineFastHandler(ctx, call.Args[1]))}
+				return []string{fmt.Sprintf("%s.HandleFastOptions(%q, %s, %s, %s)", call.Receiver, gopressHTTPMethod(method), call.Args[0], usage.compileOptions(), a.compileInlineFastHandler(ctx, call.Args[1]))}
 			}
 		}
 		args := []string{call.Args[0]}
@@ -900,20 +1043,20 @@ func (a *gopressApp) emitGopressCall(ctx *gopressEmitContext, call gopressCall) 
 		if len(call.Args) == 2 {
 			if strings.Contains(call.Args[1], "req.params.") {
 				if raw, paramName, ok := a.compileInlineRawSingleParamHandler(ctx, call.Args[1]); ok {
-					return []string{fmt.Sprintf("%s.HandleRawParam(%q, %s, %q, %s)", call.Receiver, strings.ToUpper(routeMethod), call.Args[0], paramName, raw)}
+					return []string{fmt.Sprintf("%s.HandleRawParam(%q, %s, %q, %s)", call.Receiver, gopressHTTPMethod(routeMethod), call.Args[0], paramName, raw)}
 				}
 				if raw, firstParam, secondParam, ok := a.compileInlineRawTwoParamHandler(ctx, call.Args[0], call.Args[1]); ok {
-					return []string{fmt.Sprintf("%s.HandleRawParams2(%q, %s, %q, %q, %s)", call.Receiver, strings.ToUpper(routeMethod), call.Args[0], firstParam, secondParam, raw)}
+					return []string{fmt.Sprintf("%s.HandleRawParams2(%q, %s, %q, %q, %s)", call.Receiver, gopressHTTPMethod(routeMethod), call.Args[0], firstParam, secondParam, raw)}
 				}
 				if raw, ok := a.compileInlineRawParamHandler(ctx, call.Args[1]); ok {
-					return []string{fmt.Sprintf("%s.HandleRawParams(%q, %s, %s)", call.Receiver, strings.ToUpper(routeMethod), call.Args[0], raw)}
+					return []string{fmt.Sprintf("%s.HandleRawParams(%q, %s, %s)", call.Receiver, gopressHTTPMethod(routeMethod), call.Args[0], raw)}
 				}
 			}
 			if raw, ok := a.compileInlineRawHandler(ctx, call.Args[1]); ok {
-				return []string{fmt.Sprintf("%s.HandleRaw(%q, %s, %s)", call.Receiver, strings.ToUpper(routeMethod), call.Args[0], raw)}
+				return []string{fmt.Sprintf("%s.HandleRaw(%q, %s, %s)", call.Receiver, gopressHTTPMethod(routeMethod), call.Args[0], raw)}
 			}
 			if usage, ok := a.fastHandlerUsage(call.Args[1]); ok {
-				return []string{fmt.Sprintf("%s.HandleFastOptions(%q, %s, %s, %s)", call.Receiver, strings.ToUpper(routeMethod), call.Args[0], usage.compileOptions(), a.compileInlineFastHandler(ctx, call.Args[1]))}
+				return []string{fmt.Sprintf("%s.HandleFastOptions(%q, %s, %s, %s)", call.Receiver, gopressHTTPMethod(routeMethod), call.Args[0], usage.compileOptions(), a.compileInlineFastHandler(ctx, call.Args[1]))}
 			}
 		}
 		args := make([]string, 0, len(call.Args)-1)
@@ -1096,17 +1239,18 @@ func rawSingleParamName(src string) (string, bool) {
 		return "", false
 	}
 	name := ""
-	for _, match := range gopressRequestMemberRE.FindAllStringSubmatch(src, -1) {
-		if len(match) < 3 || match[1] != "params" {
-			continue
+	ok := forEachRequestMember(src, func(group string, key string) bool {
+		if group != "params" {
+			return true
 		}
 		if name == "" {
-			name = match[2]
-			continue
+			name = key
+			return true
 		}
-		if name != match[2] {
-			return "", false
-		}
+		return name == key
+	})
+	if !ok {
+		return "", false
 	}
 	if name == "" {
 		return "", false
@@ -1120,26 +1264,29 @@ func rawTwoParamNames(src string, pathExpr string) (string, string, bool) {
 	}
 	var used [2]string
 	count := 0
-	for _, match := range gopressRequestMemberRE.FindAllStringSubmatch(src, -1) {
-		if len(match) < 3 || match[1] != "params" {
-			continue
+	ok := forEachRequestMember(src, func(group string, key string) bool {
+		if group != "params" {
+			return true
 		}
-		name := match[2]
 		seen := false
 		for idx := 0; idx < count; idx++ {
-			if used[idx] == name {
+			if used[idx] == key {
 				seen = true
 				break
 			}
 		}
 		if seen {
-			continue
+			return true
 		}
 		if count == len(used) {
-			return "", "", false
+			return false
 		}
-		used[count] = name
+		used[count] = key
 		count++
+		return true
+	})
+	if !ok {
+		return "", "", false
 	}
 	if count != 2 {
 		return "", "", false
@@ -2779,6 +2926,46 @@ func replaceRequestMembers(expr string, directParams bool, rawParams bool, rawSi
 	return out.String()
 }
 
+func forEachRequestMember(src string, visit func(group string, key string) bool) bool {
+	for offset := 0; offset < len(src); {
+		idx := strings.Index(src[offset:], "req.")
+		if idx < 0 {
+			return true
+		}
+		pos := offset + idx + len("req.")
+		groupStart := pos
+		for pos < len(src) && isASCIIIdentPart(src[pos]) {
+			pos++
+		}
+		group := src[groupStart:pos]
+		switch group {
+		case "params", "query", "body", "headers", "cookies":
+		default:
+			offset = pos
+			continue
+		}
+		if pos >= len(src) || src[pos] != '.' {
+			offset = pos
+			continue
+		}
+		pos++
+		keyStart := pos
+		if pos >= len(src) || !isASCIIIdentStart(src[pos]) {
+			offset = pos
+			continue
+		}
+		pos++
+		for pos < len(src) && isASCIIIdentPart(src[pos]) {
+			pos++
+		}
+		if !visit(group, src[keyStart:pos]) {
+			return false
+		}
+		offset = pos
+	}
+	return true
+}
+
 func compileRequestMemberReplacement(expr string, start int, directParams bool, rawParams bool, rawSingleParam string, rawParamNames []string, rawRequest bool) (string, int, bool) {
 	pos := start + len("req.")
 	groupStart := pos
@@ -2873,18 +3060,66 @@ func isASCIIIdentPart(ch byte) bool {
 }
 
 func discoverStringBuilderVars(body string) map[string]bool {
-	out := map[string]bool{}
-	for _, match := range gopressBuilderVarRE.FindAllStringSubmatch(body, -1) {
-		name := match[1]
+	var out map[string]bool
+	for pos := 0; pos < len(body); pos++ {
+		keywordLen := 0
+		switch {
+		case hasKeywordAt(body, pos, "let"):
+			keywordLen = len("let")
+		case hasKeywordAt(body, pos, "var"):
+			keywordLen = len("var")
+		default:
+			continue
+		}
+		name, ok := parseStringBuilderCandidateName(body, pos+keywordLen)
+		if !ok {
+			continue
+		}
 		if hasAddAssign(body, name) {
+			if out == nil {
+				out = map[string]bool{}
+			}
 			out[name] = true
 		}
 	}
 	return out
 }
 
+func parseStringBuilderCandidateName(src string, pos int) (string, bool) {
+	pos = skipSpace(src, pos)
+	if pos >= len(src) || !isASCIIIdentStart(src[pos]) {
+		return "", false
+	}
+	start := pos
+	pos++
+	for pos < len(src) && isASCIIIdentPart(src[pos]) {
+		pos++
+	}
+	name := src[start:pos]
+	pos = skipSpace(src, pos)
+	if pos < len(src) && src[pos] == ':' {
+		pos = skipSpace(src, pos+1)
+		if !hasKeywordAt(src, pos, "string") {
+			return "", false
+		}
+		pos += len("string")
+		pos = skipSpace(src, pos)
+	}
+	if pos >= len(src) || src[pos] != '=' {
+		return "", false
+	}
+	pos = skipSpace(src, pos+1)
+	if pos >= len(src) || (src[pos] != '"' && src[pos] != '\'') {
+		return "", false
+	}
+	return name, true
+}
+
 func discoverJSONByteBufferVars(body string, builders map[string]bool) map[string]int {
-	out := map[string]int{}
+	if len(builders) == 0 {
+		return nil
+	}
+	var out map[string]int
 	for name := range builders {
 		if !isJSONSendVar(body, name) {
 			continue
@@ -2892,6 +3127,9 @@ func discoverJSONByteBufferVars(body string, builders map[string]bool) map[strin
 		capacity := estimateJSONByteBufferCapacity(body, name)
 		if capacity < 64 {
 			capacity = 64
+		}
+		if out == nil {
+			out = map[string]int{}
 		}
 		out[name] = capacity
 	}
