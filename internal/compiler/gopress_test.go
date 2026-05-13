@@ -38,7 +38,7 @@ export default app
 		`godeJSON := make([]byte, 0, `,
 		`godeJSON = append(godeJSON, "{\"id\":"...)`,
 		`godeJSON = strconv.AppendQuote(godeJSON, param)`,
-		`return gopress.WriteJSONBytes(w, 200, godeJSON)`,
+		`return gopress.WriteJSONBytesOK(w, godeJSON)`,
 		"return app",
 	} {
 		if !strings.Contains(result.Go, want) {
@@ -86,7 +86,7 @@ export default app
 		`app.HandleRawParams2("GET", "/users/:userId/notes/:noteId", "userId", "noteId", func(w http.ResponseWriter, request *http.Request, param0 string, param1 string) error {`,
 		`godeJSON = strconv.AppendQuote(godeJSON, param0)`,
 		`godeJSON = strconv.AppendQuote(godeJSON, param1)`,
-		`return gopress.WriteJSONBytes(w, 200, godeJSON)`,
+		`return gopress.WriteJSONBytesOK(w, godeJSON)`,
 	} {
 		if !strings.Contains(result.Go, want) {
 			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
@@ -128,7 +128,7 @@ export default app
 		`godeJSON = strconv.AppendQuote(godeJSON, param1)`,
 		`godeJSON = append(godeJSON, ",\"userId\":"...)`,
 		`godeJSON = strconv.AppendQuote(godeJSON, param0)`,
-		`return gopress.WriteJSONBytes(w, 200, godeJSON)`,
+		`return gopress.WriteJSONBytesOK(w, godeJSON)`,
 	} {
 		if !strings.Contains(result.Go, want) {
 			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
@@ -234,7 +234,7 @@ export default app
 		`godeJSON := make([]byte, 0, `,
 		`godeJSON = append(godeJSON, "{\"page\":"...)`,
 		`godeJSON = strconv.AppendQuote(godeJSON, gopress.QueryValue(request, "page"))`,
-		`return gopress.WriteJSONBytes(w, 200, godeJSON)`,
+		`return gopress.WriteJSONBytesOK(w, godeJSON)`,
 	} {
 		if !strings.Contains(result.Go, want) {
 			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
@@ -378,7 +378,7 @@ export default app
 		`godeJSON = strconv.AppendInt(godeJSON, int64(result.iterations), 10)`,
 		`godeJSON = append(godeJSON, ",\"sum\":"...)`,
 		`godeJSON = strconv.AppendInt(godeJSON, int64(result.sum), 10)`,
-		`return gopress.WriteJSONBytes(w, 200, godeJSON)`,
+		`return gopress.WriteJSONBytesOK(w, godeJSON)`,
 	} {
 		if !strings.Contains(result.Go, want) {
 			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
@@ -504,7 +504,7 @@ export default app
 		`payload = strconv.AppendInt(payload, int64(i), 10)`,
 		`payload = append(payload, ",\"name\":\"note\"}"...)`,
 		`payload = append(payload, "]}"...)`,
-		`return gopress.WriteJSONBytes(w, 200, payload)`,
+		`return gopress.WriteJSONBytesOK(w, payload)`,
 	} {
 		if !strings.Contains(result.Go, want) {
 			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
@@ -543,7 +543,7 @@ export default app
 		`const chunk = "{\"id\":1}"`,
 		`payload = append(payload, chunk...)`,
 		`app.HandleRaw("GET", "/json", func(w http.ResponseWriter, request *http.Request) error {`,
-		`return gopress.WriteJSONBytes(w, 200, payload)`,
+		`return gopress.WriteJSONBytesOK(w, payload)`,
 	} {
 		if !strings.Contains(result.Go, want) {
 			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
@@ -768,7 +768,7 @@ export default app
 	for _, unwanted := range []string{
 		`make([]byte`,
 		`strconv.Append`,
-		`gopress.WriteJSONBytes(w, 200`,
+		`gopress.WriteJSONBytesOK(w`,
 		`gopress.WriteJSON(w, 200`,
 	} {
 		if strings.Contains(result.Go, unwanted) {
@@ -801,7 +801,7 @@ export default app
 	for _, want := range []string{
 		`app.HandleRaw("GET", "/json", func(w http.ResponseWriter, request *http.Request) error {`,
 		"payload := make([]byte, 0, ",
-		`return gopress.WriteJSONBytes(w, 200, payload)`,
+		`return gopress.WriteJSONBytesOK(w, payload)`,
 	} {
 		if !strings.Contains(result.Go, want) {
 			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
@@ -817,7 +817,7 @@ func TestGopressCompilerAvoidsRegexAllocationChurn(t *testing.T) {
 			t.Fatalf("unexpected diagnostics:\n%s", result.Diagnostics.String())
 		}
 	})
-	if allocs > 1210 {
-		t.Fatalf("gopress compiler allocations too high: got %.0f allocs/run, want <= 1210", allocs)
+	if allocs > 1202 {
+		t.Fatalf("gopress compiler allocations too high: got %.0f allocs/run, want <= 1202", allocs)
 	}
 }

@@ -1536,7 +1536,7 @@ func rewriteRawHandlerLine(line string) (string, bool) {
 		if !ok {
 			return "", false
 		}
-		return "return gopress.WriteJSONBytes(w, 200, " + arg + ")", true
+		return rawJSONBytesReturn("200", arg), true
 	case strings.HasPrefix(expr, "res.JSONString("):
 		arg, ok := singleCallArg(expr, "res.JSONString")
 		if !ok {
@@ -2132,7 +2132,7 @@ func (c *gopressBodyContext) compileRawResponseStatement(expr string) ([]string,
 	if status, name, ok := parseResponseJSONTypeSend(expr); ok {
 		switch {
 		case c.byteBuffers[name] > 0:
-			return []string{"return gopress.WriteJSONBytes(w, " + status + ", " + name + ")"}, true
+			return []string{rawJSONBytesReturn(status, name)}, true
 		case c.builders[name]:
 			return []string{"return gopress.WriteJSONString(w, " + status + ", " + name + ".String())"}, true
 		default:
@@ -2327,8 +2327,24 @@ func (c *gopressBodyContext) compileRawJSONByteResponse(status string, expr stri
 	}
 	name := c.nextJSONVar()
 	lines := c.compileJSONByteFields(name, fields)
-	lines = append(lines, "return gopress.WriteJSONBytes(w, "+status+", "+name+")")
+	lines = append(lines, rawJSONBytesReturn(status, name))
 	return lines, true
+}
+
+func rawJSONBytesReturn(status string, body string) string {
+	if isStatusOKLiteral(status) {
+		return "return gopress.WriteJSONBytesOK(w, " + body + ")"
+	}
+	return "return gopress.WriteJSONBytes(w, " + status + ", " + body + ")"
+}
+
+func isStatusOKLiteral(status string) bool {
+	switch strings.TrimSpace(status) {
+	case "200", "http.StatusOK":
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *gopressBodyContext) compileStaticJSON(expr string) (string, bool) {
