@@ -551,6 +551,41 @@ export default app
 	}
 }
 
+func TestGopressSendStatusUsesRawHandler(t *testing.T) {
+	src := []byte(`
+import gopress, { Request, Response } from "gopress"
+
+const app = gopress()
+
+app.get("/gone", async (req: Request, res: Response) => {
+  return res.sendStatus(410)
+})
+
+export default app
+`)
+
+	result := compiler.CompileFile("app.ts", src, config.Default().WithFramework("gopress").WithPackage("main"))
+	if result.Diagnostics.HasErrors() {
+		t.Fatalf("unexpected diagnostics:\n%s", result.Diagnostics.String())
+	}
+	for _, want := range []string{
+		`app.HandleRaw("GET", "/gone", func(w http.ResponseWriter, request *http.Request) error {`,
+		`return gopress.WriteRawString(w, 410, "text/plain", "Gone")`,
+	} {
+		if !strings.Contains(result.Go, want) {
+			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
+		}
+	}
+	for _, unwanted := range []string{
+		`app.HandleFastOptions("GET", "/gone"`,
+		`res.SendStatus(410)`,
+	} {
+		if strings.Contains(result.Go, unwanted) {
+			t.Fatalf("generated Go should not contain %q:\n%s", unwanted, result.Go)
+		}
+	}
+}
+
 func TestGopressJSONByteBufferDetectionAllowsWhitespace(t *testing.T) {
 	src := []byte(`
 import gopress, { Request, Response } from "gopress"

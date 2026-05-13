@@ -1142,7 +1142,7 @@ func canCompileRawParamHandler(src string) bool {
 	if !rawRequestUsageSupported(trimmed, true) {
 		return false
 	}
-	for _, unsupported := range []string{"req.body", "res.set(", "res.cookie(", "res.sendFile(", "res.sendStatus("} {
+	for _, unsupported := range []string{"req.body", "res.set(", "res.cookie(", "res.sendFile("} {
 		if strings.Contains(trimmed, unsupported) {
 			return false
 		}
@@ -1183,7 +1183,7 @@ func canCompileRawHandler(src string) bool {
 	if !rawRequestUsageSupported(trimmed, false) {
 		return false
 	}
-	for _, unsupported := range []string{"res.set(", "res.cookie(", "res.sendFile(", "res.sendStatus("} {
+	for _, unsupported := range []string{"res.set(", "res.cookie(", "res.sendFile("} {
 		if strings.Contains(trimmed, unsupported) {
 			return false
 		}
@@ -1852,6 +1852,9 @@ func (c *gopressBodyContext) compileResponseChain(expr string) string {
 
 func (c *gopressBodyContext) compileRawResponseStatement(expr string) ([]string, bool) {
 	expr = strings.TrimSpace(expr)
+	if status, ok := parseResponseSendStatusCall(expr); ok {
+		return []string{`return gopress.WriteRawString(w, ` + status + `, "text/plain", ` + sendStatusBodyExpr(status) + ")"}, true
+	}
 	if status, location, ok := parseResponseRedirectCall(expr); ok {
 		return []string{
 			`w.Header().Set("Location", ` + c.compileExpr(location) + ")",
@@ -1880,6 +1883,30 @@ func (c *gopressBodyContext) compileRawResponseStatement(expr string) ([]string,
 		return []string{"return gopress.WriteJSON(w, " + status + ", " + c.compileExpr(arg) + ")"}, true
 	}
 	return nil, false
+}
+
+func parseResponseSendStatusCall(expr string) (string, bool) {
+	args, ok := callArgs(strings.TrimSpace(expr), "res.sendStatus")
+	if !ok || len(args) != 1 {
+		return "", false
+	}
+	status := strings.TrimSpace(args[0])
+	if _, err := strconv.Atoi(status); err != nil {
+		return "", false
+	}
+	return status, true
+}
+
+func sendStatusBodyExpr(status string) string {
+	value, err := strconv.Atoi(strings.TrimSpace(status))
+	if err != nil {
+		return strconv.Quote("")
+	}
+	text := http.StatusText(value)
+	if text == "" {
+		text = strconv.Itoa(value)
+	}
+	return strconv.Quote(text)
 }
 
 func parseResponseRedirectCall(expr string) (string, string, bool) {
