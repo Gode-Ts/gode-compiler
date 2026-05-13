@@ -240,7 +240,8 @@ export default app
 		"start := time.Now()",
 		"result := runLoop(iterations)",
 		"durationMs := float64(time.Since(start).Microseconds()) / 1000.0",
-		`return res.Status(200).JSON(godeMergeJSON(map[string]any{"runtime": "gopress", "durationMs": durationMs}, result))`,
+		`app.HandleRaw("GET", "/bench", func(w http.ResponseWriter, request *http.Request) error {`,
+		`return gopress.WriteJSON(w, 200, godeMergeJSON(map[string]any{"runtime": "gopress", "durationMs": durationMs}, result))`,
 		"func godeMergeJSON(parts ...map[string]any) map[string]any",
 	} {
 		if !strings.Contains(result.Go, want) {
@@ -249,6 +250,10 @@ export default app
 	}
 	if strings.Contains(result.Go, `"strconv"`) {
 		t.Fatalf("spread fallback should not leave unused strconv import:\n%s", result.Go)
+	}
+	if strings.Contains(result.Go, `return map[string]any{"iterations": iterations, "sum": sum}
+	return nil`) {
+		t.Fatalf("generated helper should not include unreachable return nil:\n%s", result.Go)
 	}
 }
 
@@ -304,6 +309,8 @@ export default app
 	}
 	for _, want := range []string{
 		`"strconv"`,
+		`"net/http"`,
+		`app.HandleRaw("GET", "/json", func(w http.ResponseWriter, request *http.Request) error {`,
 		"payload := make([]byte, 0, ",
 		`payload = append(payload, "{\"items\":["...)`,
 		`payload = append(payload, ","...)`,
@@ -311,7 +318,7 @@ export default app
 		`payload = strconv.AppendInt(payload, int64(i), 10)`,
 		`payload = append(payload, ",\"name\":\"note\"}"...)`,
 		`payload = append(payload, "]}"...)`,
-		`return res.JSONBytes(payload)`,
+		`return gopress.WriteJSONBytes(w, 200, payload)`,
 	} {
 		if !strings.Contains(result.Go, want) {
 			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
@@ -349,7 +356,8 @@ export default app
 	for _, want := range []string{
 		`const chunk = "{\"id\":1}"`,
 		`payload = append(payload, chunk...)`,
-		`return res.JSONBytes(payload)`,
+		`app.HandleRaw("GET", "/json", func(w http.ResponseWriter, request *http.Request) error {`,
+		`return gopress.WriteJSONBytes(w, 200, payload)`,
 	} {
 		if !strings.Contains(result.Go, want) {
 			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
@@ -382,8 +390,9 @@ export default app
 		t.Fatalf("unexpected diagnostics:\n%s", result.Diagnostics.String())
 	}
 	for _, want := range []string{
+		`app.HandleRaw("GET", "/json", func(w http.ResponseWriter, request *http.Request) error {`,
 		"payload := make([]byte, 0, ",
-		`return res.JSONBytes(payload)`,
+		`return gopress.WriteJSONBytes(w, 200, payload)`,
 	} {
 		if !strings.Contains(result.Go, want) {
 			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)

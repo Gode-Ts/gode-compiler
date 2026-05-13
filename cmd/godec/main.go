@@ -12,7 +12,7 @@ import (
 	"github.com/Gode-Ts/gode-compiler/internal/config"
 )
 
-const version = "0.1.6"
+const version = "0.1.7"
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))

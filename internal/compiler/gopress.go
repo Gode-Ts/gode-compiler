@@ -431,7 +431,7 @@ func (a *gopressApp) emit() (string, diagnostics.List) {
 		for _, line := range helper.Lines {
 			w("%s", line)
 		}
-		if helper.ReturnType != "" {
+		if helper.ReturnType != "" && !gopressLinesReturn(helper.Lines) {
 			w("%s", zeroReturnStatement(helper.ReturnType))
 		}
 		w("}")
@@ -535,6 +535,15 @@ func (c *gopressEmitContext) addImport(path string) {
 	c.imports[path] = true
 }
 
+func (c *gopressEmitContext) merge(other *gopressEmitContext) {
+	for path := range other.imports {
+		c.imports[path] = true
+	}
+	if other.needsMergeJSON {
+		c.needsMergeJSON = true
+	}
+}
+
 func (c *gopressEmitContext) sortedImports() []string {
 	imports := make([]string, 0, len(c.imports))
 	for path := range c.imports {
@@ -554,6 +563,9 @@ func (a *gopressApp) emitGopressCall(ctx *gopressEmitContext, call gopressCall) 
 			return nil
 		}
 		if len(call.Args) == 2 {
+			if raw, ok := a.compileInlineRawHandler(ctx, call.Args[1]); ok {
+				return []string{fmt.Sprintf("%s.HandleRaw(%q, %s, %s)", call.Receiver, strings.ToUpper(method), call.Args[0], raw)}
+			}
 			if usage, ok := a.fastHandlerUsage(call.Args[1]); ok {
 				return []string{fmt.Sprintf("%s.HandleFastOptions(%q, %s, %s, %s)", call.Receiver, strings.ToUpper(method), call.Args[0], usage.compileOptions(), a.compileInlineFastHandler(ctx, call.Args[1]))}
 			}
@@ -710,6 +722,150 @@ func (a *gopressApp) compileInlineFastHandler(ctx *gopressEmitContext, src strin
 	lines, bodyDiags := compileGopressBodyWithOptions(ctx, a.path, src[bodyStart+1:bodyEnd], nil, gopressBodyOptions{directParams: true})
 	a.diags = append(a.diags, bodyDiags...)
 	return formatGopressFunc("func(req *gopress.Request, res *gopress.Response) error", lines)
+}
+
+func (a *gopressApp) compileInlineRawHandler(ctx *gopressEmitContext, src string) (string, bool) {
+	if !canCompileRawHandler(src) {
+		return "", false
+	}
+	bodyStart := strings.Index(src, "{")
+	bodyEnd := strings.LastIndex(src, "}")
+	if bodyStart < 0 || bodyEnd < bodyStart {
+		return "", false
+	}
+	body := src[bodyStart+1 : bodyEnd]
+	rawCtx := newGopressEmitContext()
+	lines, bodyDiags := compileGopressBodyWithOptions(rawCtx, a.path, body, nil, gopressBodyOptions{})
+	if bodyDiags.HasErrors() {
+		return "", false
+	}
+	rawLines, ok := rewriteRawHandlerLines(lines)
+	if !ok {
+		return "", false
+	}
+	ctx.merge(rawCtx)
+	a.diags = append(a.diags, bodyDiags...)
+	ctx.addImport("net/http")
+	return formatGopressFunc("func(w http.ResponseWriter, request *http.Request) error", rawLines), true
+}
+
+func canCompileRawHandler(src string) bool {
+	trimmed := strings.TrimSpace(src)
+	if !strings.Contains(trimmed, "=>") || strings.Contains(trimmed, "req.") || strings.Contains(trimmed, "next") || isErrorArrow(trimmed) {
+		return false
+	}
+	for _, unsupported := range []string{"res.set(", "res.cookie(", "res.redirect(", "res.sendFile(", "res.sendStatus("} {
+		if strings.Contains(trimmed, unsupported) {
+			return false
+		}
+	}
+	return strings.Contains(trimmed, "res.")
+}
+
+func rewriteRawHandlerLines(lines []string) ([]string, bool) {
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		rewritten, ok := rewriteRawHandlerLine(line)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, rewritten)
+	}
+	return out, true
+}
+
+func rewriteRawHandlerLine(line string) (string, bool) {
+	trimmed := strings.TrimSpace(line)
+	if !strings.Contains(trimmed, "res.") {
+		return line, true
+	}
+	if !strings.HasPrefix(trimmed, "return ") {
+		return "", false
+	}
+	expr := strings.TrimSpace(strings.TrimPrefix(trimmed, "return "))
+	switch {
+	case strings.HasPrefix(expr, "res.JSONBytes("):
+		arg, ok := singleCallArg(expr, "res.JSONBytes")
+		if !ok {
+			return "", false
+		}
+		return "return gopress.WriteJSONBytes(w, 200, " + arg + ")", true
+	case strings.HasPrefix(expr, "res.JSONString("):
+		arg, ok := singleCallArg(expr, "res.JSONString")
+		if !ok {
+			return "", false
+		}
+		return "return gopress.WriteJSONString(w, 200, " + arg + ")", true
+	case strings.HasPrefix(expr, "res.StatusJSON("):
+		args, ok := callArgs(expr, "res.StatusJSON")
+		if !ok || len(args) != 2 {
+			return "", false
+		}
+		return "return gopress.WriteJSONString(w, " + args[0] + ", " + args[1] + ")", true
+	case strings.HasPrefix(expr, "res.StatusSend("):
+		args, ok := callArgs(expr, "res.StatusSend")
+		if !ok || len(args) != 3 {
+			return "", false
+		}
+		return "return gopress.WriteRawString(w, " + args[0] + ", " + args[1] + ", " + args[2] + ")", true
+	case strings.HasPrefix(expr, "res.Status("):
+		return rewriteRawStatusChain(expr)
+	case strings.HasPrefix(expr, "res.Send("):
+		arg, ok := singleCallArg(expr, "res.Send")
+		if !ok {
+			return "", false
+		}
+		return `return gopress.WriteRawString(w, 200, "text/plain", ` + arg + ")", true
+	}
+	return "", false
+}
+
+func rewriteRawStatusChain(expr string) (string, bool) {
+	open := strings.IndexByte(expr, '(')
+	close := findMatching(expr, open, '(', ')')
+	if close < 0 {
+		return "", false
+	}
+	status := strings.TrimSpace(expr[open+1 : close])
+	rest := strings.TrimSpace(expr[close+1:])
+	if strings.HasPrefix(rest, ".Send(") {
+		arg, ok := singleCallArg("res"+rest, "res.Send")
+		if !ok {
+			return "", false
+		}
+		return `return gopress.WriteRawString(w, ` + status + `, "text/plain", ` + arg + ")", true
+	}
+	if strings.HasPrefix(rest, ".JSON(") {
+		arg, ok := singleCallArg("res"+rest, "res.JSON")
+		if !ok {
+			return "", false
+		}
+		return "return gopress.WriteJSON(w, " + status + ", " + arg + ")", true
+	}
+	return "", false
+}
+
+func singleCallArg(expr string, name string) (string, bool) {
+	args, ok := callArgs(expr, name)
+	if !ok || len(args) != 1 {
+		return "", false
+	}
+	return args[0], true
+}
+
+func callArgs(expr string, name string) ([]string, bool) {
+	if !strings.HasPrefix(expr, name) {
+		return nil, false
+	}
+	open := skipSpace(expr, len(name))
+	if open >= len(expr) || expr[open] != '(' {
+		return nil, false
+	}
+	close := findMatching(expr, open, '(', ')')
+	if close != len(expr)-1 {
+		return nil, false
+	}
+	return splitTopLevelArgs(expr[open+1 : close]), true
 }
 
 func (a *gopressApp) compileInlineErrorHandler(ctx *gopressEmitContext, src string) string {
