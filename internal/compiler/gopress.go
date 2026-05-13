@@ -2006,7 +2006,7 @@ func (c *gopressBodyContext) compileResponseJSONByteStatement(expr string) ([]st
 	if !ok {
 		return nil, false
 	}
-	if raw, ok := compileStaticJSONLiteral(arg); ok {
+	if raw, ok := compileStaticJSON(arg); ok {
 		return []string{"return res.Status(" + status + ").JSONString(" + raw + ")"}, true
 	}
 	fields, ok := c.flattenJSONFields(arg)
@@ -2050,7 +2050,7 @@ func parseResponseJSONCall(expr string) (string, string, bool) {
 }
 
 func (c *gopressBodyContext) compileRawJSONByteResponse(status string, expr string) ([]string, bool) {
-	if raw, ok := compileStaticJSONLiteral(expr); ok {
+	if raw, ok := compileStaticJSON(expr); ok {
 		return []string{"return gopress.WriteJSONString(w, " + status + ", " + raw + ")"}, true
 	}
 	fields, ok := c.flattenJSONFields(expr)
@@ -2061,6 +2061,17 @@ func (c *gopressBodyContext) compileRawJSONByteResponse(status string, expr stri
 	lines := c.compileJSONByteFields(name, fields)
 	lines = append(lines, "return gopress.WriteJSONBytes(w, "+status+", "+name+")")
 	return lines, true
+}
+
+func compileStaticJSON(expr string) (string, bool) {
+	if raw, ok := compileStaticJSONLiteral(expr); ok {
+		return raw, true
+	}
+	value, ok := staticJSONValue(expr)
+	if !ok {
+		return "", false
+	}
+	return strconv.Quote(value), true
 }
 
 func compileStaticJSONLiteral(expr string) (string, bool) {
