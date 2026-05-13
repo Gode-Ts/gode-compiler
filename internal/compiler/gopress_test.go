@@ -34,10 +34,10 @@ export default app
 		"func BuildGopressApp() *gopress.App",
 		"app := gopress.New()",
 		"app.Use(gopress.JSON())",
-		`app.HandleRawParams("GET", "/users/:id", func(w http.ResponseWriter, request *http.Request, params gopress.Params) error {`,
+		`app.HandleRawParam("GET", "/users/:id", "id", func(w http.ResponseWriter, request *http.Request, param string) error {`,
 		`godeJSON := make([]byte, 0, `,
 		`godeJSON = append(godeJSON, "{\"id\":"...)`,
-		`godeJSON = strconv.AppendQuote(godeJSON, params.Get("id"))`,
+		`godeJSON = strconv.AppendQuote(godeJSON, param)`,
 		`return gopress.WriteJSONBytes(w, 200, godeJSON)`,
 		"return app",
 	} {
@@ -47,9 +47,11 @@ export default app
 	}
 	for _, unwanted := range []string{
 		"app.HandleFastOptions(",
+		"app.HandleRawParams(",
 		"res.StatusJSON(",
 		`"{\"id\":"+`,
 		"req.Param(",
+		"params.Get(",
 		"res.Status(200).JSONBytes(",
 	} {
 		if strings.Contains(result.Go, unwanted) {
@@ -213,11 +215,12 @@ export default app
 	}
 	for _, want := range []string{
 		"users := gopress.Router()",
-		`users.Route("/:id").Get(func(req *gopress.Request, res *gopress.Response, next gopress.NextFunc) error {`,
-		`return res.Type("text/plain").Send(req.Method + ":" + req.Path + ":" + req.Params["id"])`,
+		`users.HandleFastOptions("GET", "/:id", gopress.FastRequestOptions{}, func(req *gopress.Request, res *gopress.Response) error {`,
+		`return res.Type("text/plain").Send(req.Method + ":" + req.Path + ":" + req.Param("id"))`,
 		`app.Use("/users", users)`,
 		`app.UseError(func(err error, req *gopress.Request, res *gopress.Response, next gopress.NextFunc) error {`,
 		`return res.Status(500).Send("error")`,
+		`app.HandleFastOptions("GET", "/go", gopress.FastRequestOptions{}, func(req *gopress.Request, res *gopress.Response) error {`,
 		`return res.Redirect("/users/1")`,
 	} {
 		if !strings.Contains(result.Go, want) {

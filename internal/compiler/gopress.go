@@ -67,18 +67,19 @@ type gopressRenderedFunc struct {
 }
 
 type gopressBodyContext struct {
-	emit         *gopressEmitContext
-	path         string
-	builders     map[string]bool
-	byteBuffers  map[string]int
-	locals       map[string]gopressLocal
-	helperShapes map[string]*gopressReturnObject
-	returnObject *gopressReturnObject
-	directParams bool
-	rawParams    bool
-	rawRequest   bool
-	rawResponse  bool
-	jsonVarCount int
+	emit           *gopressEmitContext
+	path           string
+	builders       map[string]bool
+	byteBuffers    map[string]int
+	locals         map[string]gopressLocal
+	helperShapes   map[string]*gopressReturnObject
+	returnObject   *gopressReturnObject
+	directParams   bool
+	rawParams      bool
+	rawSingleParam string
+	rawRequest     bool
+	rawResponse    bool
+	jsonVarCount   int
 }
 
 type gopressLocal struct {
@@ -87,12 +88,13 @@ type gopressLocal struct {
 }
 
 type gopressBodyOptions struct {
-	directParams bool
-	rawResponse  bool
-	rawParams    bool
-	rawRequest   bool
-	helperShapes map[string]*gopressReturnObject
-	returnObject *gopressReturnObject
+	directParams   bool
+	rawResponse    bool
+	rawParams      bool
+	rawSingleParam string
+	rawRequest     bool
+	helperShapes   map[string]*gopressReturnObject
+	returnObject   *gopressReturnObject
 }
 
 type gopressReturnObject struct {
@@ -863,6 +865,9 @@ func (a *gopressApp) emitGopressCall(ctx *gopressEmitContext, call gopressCall) 
 			return nil
 		}
 		if len(call.Args) == 2 {
+			if raw, paramName, ok := a.compileInlineRawSingleParamHandler(ctx, call.Args[1]); ok {
+				return []string{fmt.Sprintf("%s.HandleRawParam(%q, %s, %q, %s)", call.Receiver, strings.ToUpper(method), call.Args[0], paramName, raw)}
+			}
 			if raw, ok := a.compileInlineRawParamHandler(ctx, call.Args[1]); ok {
 				return []string{fmt.Sprintf("%s.HandleRawParams(%q, %s, %s)", call.Receiver, strings.ToUpper(method), call.Args[0], raw)}
 			}
@@ -883,6 +888,20 @@ func (a *gopressApp) emitGopressCall(ctx *gopressEmitContext, call gopressCall) 
 			return nil
 		}
 		routeMethod := strings.TrimPrefix(method, "route.")
+		if len(call.Args) == 2 {
+			if raw, paramName, ok := a.compileInlineRawSingleParamHandler(ctx, call.Args[1]); ok {
+				return []string{fmt.Sprintf("%s.HandleRawParam(%q, %s, %q, %s)", call.Receiver, strings.ToUpper(routeMethod), call.Args[0], paramName, raw)}
+			}
+			if raw, ok := a.compileInlineRawParamHandler(ctx, call.Args[1]); ok {
+				return []string{fmt.Sprintf("%s.HandleRawParams(%q, %s, %s)", call.Receiver, strings.ToUpper(routeMethod), call.Args[0], raw)}
+			}
+			if raw, ok := a.compileInlineRawHandler(ctx, call.Args[1]); ok {
+				return []string{fmt.Sprintf("%s.HandleRaw(%q, %s, %s)", call.Receiver, strings.ToUpper(routeMethod), call.Args[0], raw)}
+			}
+			if usage, ok := a.fastHandlerUsage(call.Args[1]); ok {
+				return []string{fmt.Sprintf("%s.HandleFastOptions(%q, %s, %s, %s)", call.Receiver, strings.ToUpper(routeMethod), call.Args[0], usage.compileOptions(), a.compileInlineFastHandler(ctx, call.Args[1]))}
+			}
+		}
 		args := make([]string, 0, len(call.Args)-1)
 		for _, arg := range call.Args[1:] {
 			args = append(args, a.compileHandlerArg(ctx, arg))
@@ -1025,6 +1044,60 @@ func (a *gopressApp) compileInlineFastHandler(ctx *gopressEmitContext, src strin
 	lines, bodyDiags := compileGopressBodyWithOptions(ctx, a.path, src[bodyStart+1:bodyEnd], nil, gopressBodyOptions{directParams: true, helperShapes: a.helperShapes})
 	a.diags = append(a.diags, bodyDiags...)
 	return formatGopressFunc("func(req *gopress.Request, res *gopress.Response) error", lines)
+}
+
+func (a *gopressApp) compileInlineRawSingleParamHandler(ctx *gopressEmitContext, src string) (string, string, bool) {
+	paramName, ok := rawSingleParamName(src)
+	if !ok {
+		return "", "", false
+	}
+	bodyStart := strings.Index(src, "{")
+	bodyEnd := strings.LastIndex(src, "}")
+	if bodyStart < 0 || bodyEnd < bodyStart {
+		return "", "", false
+	}
+	body := src[bodyStart+1 : bodyEnd]
+	rawCtx := newGopressEmitContext()
+	lines, bodyDiags := compileGopressBodyWithOptions(rawCtx, a.path, body, nil, gopressBodyOptions{
+		rawResponse:    true,
+		rawSingleParam: paramName,
+		rawRequest:     true,
+		helperShapes:   a.helperShapes,
+	})
+	if bodyDiags.HasErrors() {
+		return "", "", false
+	}
+	rawLines, ok := rewriteRawHandlerLines(lines)
+	if !ok {
+		return "", "", false
+	}
+	ctx.merge(rawCtx)
+	a.diags = append(a.diags, bodyDiags...)
+	ctx.addImport("net/http")
+	return formatGopressFunc("func(w http.ResponseWriter, request *http.Request, param string) error", rawLines), paramName, true
+}
+
+func rawSingleParamName(src string) (string, bool) {
+	if !canCompileRawParamHandler(src) {
+		return "", false
+	}
+	name := ""
+	for _, match := range gopressRequestMemberRE.FindAllStringSubmatch(src, -1) {
+		if len(match) < 3 || match[1] != "params" {
+			continue
+		}
+		if name == "" {
+			name = match[2]
+			continue
+		}
+		if name != match[2] {
+			return "", false
+		}
+	}
+	if name == "" {
+		return "", false
+	}
+	return name, true
 }
 
 func (a *gopressApp) compileInlineRawParamHandler(ctx *gopressEmitContext, src string) (string, bool) {
@@ -1324,17 +1397,18 @@ func compileGopressBodyWithOptions(ctx *gopressEmitContext, path string, body st
 		ctx.addImport("strings")
 	}
 	bodyCtx := &gopressBodyContext{
-		emit:         ctx,
-		path:         path,
-		builders:     builders,
-		byteBuffers:  byteBuffers,
-		locals:       map[string]gopressLocal{},
-		helperShapes: options.helperShapes,
-		returnObject: options.returnObject,
-		directParams: options.directParams,
-		rawParams:    options.rawParams,
-		rawRequest:   options.rawRequest,
-		rawResponse:  options.rawResponse,
+		emit:           ctx,
+		path:           path,
+		builders:       builders,
+		byteBuffers:    byteBuffers,
+		locals:         map[string]gopressLocal{},
+		helperShapes:   options.helperShapes,
+		returnObject:   options.returnObject,
+		directParams:   options.directParams,
+		rawParams:      options.rawParams,
+		rawSingleParam: options.rawSingleParam,
+		rawRequest:     options.rawRequest,
+		rawResponse:    options.rawResponse,
 	}
 	for _, param := range params {
 		bodyCtx.locals[param.Name] = gopressLocal{kind: param.GoType}
@@ -2218,19 +2292,22 @@ func (c *gopressBodyContext) replaceBuilderRefs(expr string) string {
 }
 
 func compileRequestMember(expr string) string {
-	return replaceRequestMembers(expr, false, false, false)
+	return replaceRequestMembers(expr, false, false, "", false)
 }
 
 func (c *gopressBodyContext) replaceRequestMembers(expr string) string {
-	return replaceRequestMembers(expr, c.directParams, c.rawParams, c.rawRequest)
+	return replaceRequestMembers(expr, c.directParams, c.rawParams, c.rawSingleParam, c.rawRequest)
 }
 
-func replaceRequestMembers(expr string, directParams bool, rawParams bool, rawRequest bool) string {
+func replaceRequestMembers(expr string, directParams bool, rawParams bool, rawSingleParam string, rawRequest bool) string {
 	expr = gopressRequestMemberRE.ReplaceAllStringFunc(expr, func(match string) string {
 		parts := strings.Split(match, ".")
 		key := parts[2]
 		switch parts[1] {
 		case "params":
+			if rawSingleParam != "" && key == rawSingleParam {
+				return "param"
+			}
 			if rawParams {
 				return fmt.Sprintf("params.Get(%q)", key)
 			}
