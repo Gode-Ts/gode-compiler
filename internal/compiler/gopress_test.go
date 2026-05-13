@@ -29,16 +29,31 @@ export default app
 	}
 	for _, want := range []string{
 		`"github.com/Gode-Ts/gopress"`,
+		`"net/http"`,
 		`"strconv"`,
 		"func BuildGopressApp() *gopress.App",
 		"app := gopress.New()",
 		"app.Use(gopress.JSON())",
-		`app.HandleFastOptions("GET", "/users/:id", gopress.FastRequestOptions{}, func(req *gopress.Request, res *gopress.Response) error {`,
-		`return res.StatusJSON(200, "{\"id\":"+strconv.Quote(req.Param("id"))+"}")`,
+		`app.HandleRawParams("GET", "/users/:id", func(w http.ResponseWriter, request *http.Request, params gopress.Params) error {`,
+		`godeJSON := make([]byte, 0, `,
+		`godeJSON = append(godeJSON, "{\"id\":"...)`,
+		`godeJSON = strconv.AppendQuote(godeJSON, params.Get("id"))`,
+		`return gopress.WriteJSONBytes(w, 200, godeJSON)`,
 		"return app",
 	} {
 		if !strings.Contains(result.Go, want) {
 			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
+		}
+	}
+	for _, unwanted := range []string{
+		"app.HandleFastOptions(",
+		"res.StatusJSON(",
+		`"{\"id\":"+`,
+		"req.Param(",
+		"res.Status(200).JSONBytes(",
+	} {
+		if strings.Contains(result.Go, unwanted) {
+			t.Fatalf("generated Go should not contain %q:\n%s", unwanted, result.Go)
 		}
 	}
 	for _, want := range []string{`"framework": "gopress"`, `"method": "GET"`, `"path": "/users/:id"`} {

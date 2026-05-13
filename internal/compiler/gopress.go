@@ -75,6 +75,7 @@ type gopressBodyContext struct {
 	helperShapes map[string]*gopressReturnObject
 	returnObject *gopressReturnObject
 	directParams bool
+	rawParams    bool
 	rawResponse  bool
 	jsonVarCount int
 }
@@ -87,6 +88,7 @@ type gopressLocal struct {
 type gopressBodyOptions struct {
 	directParams bool
 	rawResponse  bool
+	rawParams    bool
 	helperShapes map[string]*gopressReturnObject
 	returnObject *gopressReturnObject
 }
@@ -859,6 +861,9 @@ func (a *gopressApp) emitGopressCall(ctx *gopressEmitContext, call gopressCall) 
 			return nil
 		}
 		if len(call.Args) == 2 {
+			if raw, ok := a.compileInlineRawParamHandler(ctx, call.Args[1]); ok {
+				return []string{fmt.Sprintf("%s.HandleRawParams(%q, %s, %s)", call.Receiver, strings.ToUpper(method), call.Args[0], raw)}
+			}
 			if raw, ok := a.compileInlineRawHandler(ctx, call.Args[1]); ok {
 				return []string{fmt.Sprintf("%s.HandleRaw(%q, %s, %s)", call.Receiver, strings.ToUpper(method), call.Args[0], raw)}
 			}
@@ -1018,6 +1023,51 @@ func (a *gopressApp) compileInlineFastHandler(ctx *gopressEmitContext, src strin
 	lines, bodyDiags := compileGopressBodyWithOptions(ctx, a.path, src[bodyStart+1:bodyEnd], nil, gopressBodyOptions{directParams: true, helperShapes: a.helperShapes})
 	a.diags = append(a.diags, bodyDiags...)
 	return formatGopressFunc("func(req *gopress.Request, res *gopress.Response) error", lines)
+}
+
+func (a *gopressApp) compileInlineRawParamHandler(ctx *gopressEmitContext, src string) (string, bool) {
+	if !canCompileRawParamHandler(src) {
+		return "", false
+	}
+	bodyStart := strings.Index(src, "{")
+	bodyEnd := strings.LastIndex(src, "}")
+	if bodyStart < 0 || bodyEnd < bodyStart {
+		return "", false
+	}
+	body := src[bodyStart+1 : bodyEnd]
+	rawCtx := newGopressEmitContext()
+	lines, bodyDiags := compileGopressBodyWithOptions(rawCtx, a.path, body, nil, gopressBodyOptions{
+		rawResponse:  true,
+		rawParams:    true,
+		helperShapes: a.helperShapes,
+	})
+	if bodyDiags.HasErrors() {
+		return "", false
+	}
+	rawLines, ok := rewriteRawHandlerLines(lines)
+	if !ok {
+		return "", false
+	}
+	ctx.merge(rawCtx)
+	a.diags = append(a.diags, bodyDiags...)
+	ctx.addImport("net/http")
+	return formatGopressFunc("func(w http.ResponseWriter, request *http.Request, params gopress.Params) error", rawLines), true
+}
+
+func canCompileRawParamHandler(src string) bool {
+	trimmed := strings.TrimSpace(src)
+	if !strings.Contains(trimmed, "=>") || strings.Contains(trimmed, "next") || isErrorArrow(trimmed) {
+		return false
+	}
+	if !strings.Contains(trimmed, "req.params.") {
+		return false
+	}
+	for _, unsupported := range []string{"req.query", "req.body", "req.headers", "req.cookies", "req.method", "req.path", "res.set(", "res.cookie(", "res.redirect(", "res.sendFile(", "res.sendStatus("} {
+		if strings.Contains(trimmed, unsupported) {
+			return false
+		}
+	}
+	return strings.Contains(trimmed, "res.")
 }
 
 func (a *gopressApp) compileInlineRawHandler(ctx *gopressEmitContext, src string) (string, bool) {
@@ -1219,6 +1269,7 @@ func compileGopressBodyWithOptions(ctx *gopressEmitContext, path string, body st
 		helperShapes: options.helperShapes,
 		returnObject: options.returnObject,
 		directParams: options.directParams,
+		rawParams:    options.rawParams,
 		rawResponse:  options.rawResponse,
 	}
 	for _, param := range params {
@@ -1360,6 +1411,11 @@ func (c *gopressBodyContext) compileStatement(stmt string) ([]string, diagnostic
 				return lines, nil
 			}
 		}
+		if strings.HasPrefix(expr, "res.") {
+			if lines, ok := c.compileResponseJSONByteStatement(expr); ok {
+				return lines, nil
+			}
+		}
 		if c.returnObject != nil && strings.HasPrefix(expr, "{") {
 			if compiled, ok := c.compileReturnObjectLiteral(expr); ok {
 				return []string{"return " + compiled}, nil
@@ -1370,6 +1426,11 @@ func (c *gopressBodyContext) compileStatement(stmt string) ([]string, diagnostic
 	if strings.HasPrefix(stmt, "res.") || strings.HasPrefix(stmt, "next(") {
 		if c.rawResponse && strings.HasPrefix(stmt, "res.") {
 			if lines, ok := c.compileRawResponseStatement(stmt); ok {
+				return lines, nil
+			}
+		}
+		if strings.HasPrefix(stmt, "res.") {
+			if lines, ok := c.compileResponseJSONByteStatement(stmt); ok {
 				return lines, nil
 			}
 		}
@@ -1653,12 +1714,28 @@ func (c *gopressBodyContext) compileResponseChain(expr string) string {
 func (c *gopressBodyContext) compileRawResponseStatement(expr string) ([]string, bool) {
 	expr = strings.TrimSpace(expr)
 	if status, arg, ok := parseResponseJSONCall(expr); ok {
-		if lines, ok := c.compileJSONByteResponse(status, arg); ok {
+		if lines, ok := c.compileRawJSONByteResponse(status, arg); ok {
 			return lines, true
 		}
 		return []string{"return gopress.WriteJSON(w, " + status + ", " + c.compileExpr(arg) + ")"}, true
 	}
 	return nil, false
+}
+
+func (c *gopressBodyContext) compileResponseJSONByteStatement(expr string) ([]string, bool) {
+	expr = strings.TrimSpace(expr)
+	status, arg, ok := parseResponseJSONCall(expr)
+	if !ok {
+		return nil, false
+	}
+	fields, ok := c.flattenJSONFields(arg)
+	if !ok {
+		return nil, false
+	}
+	name := c.nextJSONVar()
+	lines := c.compileJSONByteFields(name, fields)
+	lines = append(lines, "return res.Status("+status+").JSONBytes("+name+")")
+	return lines, true
 }
 
 func parseResponseJSONCall(expr string) (string, string, bool) {
@@ -1691,7 +1768,7 @@ func parseResponseJSONCall(expr string) (string, string, bool) {
 	return "", "", false
 }
 
-func (c *gopressBodyContext) compileJSONByteResponse(status string, expr string) ([]string, bool) {
+func (c *gopressBodyContext) compileRawJSONByteResponse(status string, expr string) ([]string, bool) {
 	fields, ok := c.flattenJSONFields(expr)
 	if !ok {
 		return nil, false
@@ -1739,6 +1816,9 @@ func (c *gopressBodyContext) flattenJSONFields(expr string) ([]gopressObjectFiel
 			goType = c.selectorGoType(part.Expr)
 		}
 		if goType == "" && isStringLiteral(part.Expr) {
+			goType = "string"
+		}
+		if goType == "" && strings.HasPrefix(part.Expr, "req.") {
 			goType = "string"
 		}
 		if goType == "" {
@@ -2074,19 +2154,22 @@ func (c *gopressBodyContext) replaceBuilderRefs(expr string) string {
 }
 
 func compileRequestMember(expr string) string {
-	return replaceRequestMembers(expr, false)
+	return replaceRequestMembers(expr, false, false)
 }
 
 func (c *gopressBodyContext) replaceRequestMembers(expr string) string {
-	return replaceRequestMembers(expr, c.directParams)
+	return replaceRequestMembers(expr, c.directParams, c.rawParams)
 }
 
-func replaceRequestMembers(expr string, directParams bool) string {
+func replaceRequestMembers(expr string, directParams bool, rawParams bool) string {
 	expr = gopressRequestMemberRE.ReplaceAllStringFunc(expr, func(match string) string {
 		parts := strings.Split(match, ".")
 		key := parts[2]
 		switch parts[1] {
 		case "params":
+			if rawParams {
+				return fmt.Sprintf("params.Get(%q)", key)
+			}
 			if directParams {
 				return fmt.Sprintf("req.Param(%q)", key)
 			}
