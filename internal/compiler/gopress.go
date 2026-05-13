@@ -2748,55 +2748,128 @@ func (c *gopressBodyContext) replaceRequestMembers(expr string) string {
 }
 
 func replaceRequestMembers(expr string, directParams bool, rawParams bool, rawSingleParam string, rawParamNames []string, rawRequest bool) string {
-	expr = gopressRequestMemberRE.ReplaceAllStringFunc(expr, func(match string) string {
-		parts := strings.Split(match, ".")
-		key := parts[2]
-		switch parts[1] {
-		case "params":
-			for idx, name := range rawParamNames {
-				if key == name {
-					return fmt.Sprintf("param%d", idx)
-				}
-			}
-			if rawSingleParam != "" && key == rawSingleParam {
-				return "param"
-			}
-			if rawParams {
-				return fmt.Sprintf("params.Get(%q)", key)
-			}
-			if directParams {
-				return fmt.Sprintf("req.Param(%q)", key)
-			}
-			return fmt.Sprintf("req.Params[%q]", key)
-		case "query":
-			if rawRequest {
-				return fmt.Sprintf("gopress.QueryValue(request, %q)", key)
-			}
-			return fmt.Sprintf("req.Query[%q]", key)
-		case "body":
-			return fmt.Sprintf("req.Body[%q]", key)
-		case "headers":
-			if rawRequest {
-				return fmt.Sprintf("gopress.HeaderValue(request, %q)", strings.ToLower(key))
-			}
-			return fmt.Sprintf("req.Headers[%q]", strings.ToLower(key))
-		case "cookies":
-			if rawRequest {
-				return fmt.Sprintf("gopress.CookieValue(request, %q)", key)
-			}
-			return fmt.Sprintf("req.Cookies[%q]", key)
-		default:
-			return match
-		}
-	})
-	if rawRequest {
-		expr = strings.ReplaceAll(expr, "req.method", "request.Method")
-		expr = strings.ReplaceAll(expr, "req.path", "request.URL.Path")
-	} else {
-		expr = strings.ReplaceAll(expr, "req.method", "req.Method")
-		expr = strings.ReplaceAll(expr, "req.path", "req.Path")
+	if !strings.Contains(expr, "req.") {
+		return expr
 	}
-	return expr
+	var out strings.Builder
+	out.Grow(len(expr))
+	pos := 0
+	changed := false
+	for pos < len(expr) {
+		idx := strings.Index(expr[pos:], "req.")
+		if idx < 0 {
+			break
+		}
+		start := pos + idx
+		replacement, end, ok := compileRequestMemberReplacement(expr, start, directParams, rawParams, rawSingleParam, rawParamNames, rawRequest)
+		if !ok {
+			out.WriteString(expr[pos : start+len("req.")])
+			pos = start + len("req.")
+			continue
+		}
+		out.WriteString(expr[pos:start])
+		out.WriteString(replacement)
+		pos = end
+		changed = true
+	}
+	if !changed {
+		return expr
+	}
+	out.WriteString(expr[pos:])
+	return out.String()
+}
+
+func compileRequestMemberReplacement(expr string, start int, directParams bool, rawParams bool, rawSingleParam string, rawParamNames []string, rawRequest bool) (string, int, bool) {
+	pos := start + len("req.")
+	groupStart := pos
+	for pos < len(expr) && isASCIIIdentPart(expr[pos]) {
+		pos++
+	}
+	group := expr[groupStart:pos]
+	switch group {
+	case "method":
+		if pos < len(expr) && isASCIIIdentPart(expr[pos]) {
+			return "", start, false
+		}
+		if rawRequest {
+			return "request.Method", pos, true
+		}
+		return "req.Method", pos, true
+	case "path":
+		if pos < len(expr) && isASCIIIdentPart(expr[pos]) {
+			return "", start, false
+		}
+		if rawRequest {
+			return "request.URL.Path", pos, true
+		}
+		return "req.Path", pos, true
+	case "params", "query", "body", "headers", "cookies":
+	default:
+		return "", start, false
+	}
+	if pos >= len(expr) || expr[pos] != '.' {
+		return "", start, false
+	}
+	pos++
+	keyStart := pos
+	if pos >= len(expr) || !isASCIIIdentStart(expr[pos]) {
+		return "", start, false
+	}
+	pos++
+	for pos < len(expr) && isASCIIIdentPart(expr[pos]) {
+		pos++
+	}
+	key := expr[keyStart:pos]
+	switch group {
+	case "params":
+		for idx, name := range rawParamNames {
+			if key == name {
+				return "param" + strconv.Itoa(idx), pos, true
+			}
+		}
+		if rawSingleParam != "" && key == rawSingleParam {
+			return "param", pos, true
+		}
+		quoted := strconv.Quote(key)
+		if rawParams {
+			return "params.Get(" + quoted + ")", pos, true
+		}
+		if directParams {
+			return "req.Param(" + quoted + ")", pos, true
+		}
+		return "req.Params[" + quoted + "]", pos, true
+	case "query":
+		quoted := strconv.Quote(key)
+		if rawRequest {
+			return "gopress.QueryValue(request, " + quoted + ")", pos, true
+		}
+		return "req.Query[" + quoted + "]", pos, true
+	case "body":
+		return "req.Body[" + strconv.Quote(key) + "]", pos, true
+	case "headers":
+		key = strings.ToLower(key)
+		quoted := strconv.Quote(key)
+		if rawRequest {
+			return "gopress.HeaderValue(request, " + quoted + ")", pos, true
+		}
+		return "req.Headers[" + quoted + "]", pos, true
+	case "cookies":
+		quoted := strconv.Quote(key)
+		if rawRequest {
+			return "gopress.CookieValue(request, " + quoted + ")", pos, true
+		}
+		return "req.Cookies[" + quoted + "]", pos, true
+	default:
+		return "", start, false
+	}
+}
+
+func isASCIIIdentStart(ch byte) bool {
+	return ch == '_' || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')
+}
+
+func isASCIIIdentPart(ch byte) bool {
+	return isASCIIIdentStart(ch) || (ch >= '0' && ch <= '9')
 }
 
 func discoverStringBuilderVars(body string) map[string]bool {
