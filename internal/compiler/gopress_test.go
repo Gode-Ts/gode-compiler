@@ -473,6 +473,45 @@ export default app
 	}
 }
 
+func TestGopressJSONByteBufferWithStatusUsesRawBytes(t *testing.T) {
+	src := []byte(`
+import gopress, { Request, Response } from "gopress"
+
+const app = gopress()
+
+app.post("/json", async (req: Request, res: Response) => {
+  let payload = "{"
+  payload += "\"created\":true"
+  payload += "}"
+  return res.status(201).type("application/json").send(payload)
+})
+
+export default app
+`)
+
+	result := compiler.CompileFile("app.ts", src, config.Default().WithFramework("gopress").WithPackage("main"))
+	if result.Diagnostics.HasErrors() {
+		t.Fatalf("unexpected diagnostics:\n%s", result.Diagnostics.String())
+	}
+	for _, want := range []string{
+		`app.HandleRaw("POST", "/json", func(w http.ResponseWriter, request *http.Request) error {`,
+		"payload := make([]byte, 0, ",
+		`return gopress.WriteJSONBytes(w, 201, payload)`,
+	} {
+		if !strings.Contains(result.Go, want) {
+			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
+		}
+	}
+	for _, unwanted := range []string{
+		`res.Status(201).Type("application/json").Send`,
+		`gopress.WriteRawString(w, 201, "application/json"`,
+	} {
+		if strings.Contains(result.Go, unwanted) {
+			t.Fatalf("generated Go should not contain %q:\n%s", unwanted, result.Go)
+		}
+	}
+}
+
 func TestGopressJSONByteBufferDetectionAllowsWhitespace(t *testing.T) {
 	src := []byte(`
 import gopress, { Request, Response } from "gopress"

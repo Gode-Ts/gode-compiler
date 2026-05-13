@@ -1851,6 +1851,18 @@ func (c *gopressBodyContext) compileResponseChain(expr string) string {
 
 func (c *gopressBodyContext) compileRawResponseStatement(expr string) ([]string, bool) {
 	expr = strings.TrimSpace(expr)
+	if status, name, ok := parseResponseJSONTypeSend(expr); ok {
+		switch {
+		case c.byteBuffers[name] > 0:
+			return []string{"return gopress.WriteJSONBytes(w, " + status + ", " + name + ")"}, true
+		case c.builders[name]:
+			return []string{"return gopress.WriteJSONString(w, " + status + ", " + name + ".String())"}, true
+		default:
+			if local, ok := c.locals[name]; ok && local.kind == "string" {
+				return []string{"return gopress.WriteJSONString(w, " + status + ", " + name + ")"}, true
+			}
+		}
+	}
 	if status, contentType, arg, ok := parseResponseTextCall(expr); ok {
 		return []string{"return gopress.WriteRawString(w, " + status + ", " + contentType + ", " + c.compileExpr(arg) + ")"}, true
 	}
@@ -1861,6 +1873,22 @@ func (c *gopressBodyContext) compileRawResponseStatement(expr string) ([]string,
 		return []string{"return gopress.WriteJSON(w, " + status + ", " + c.compileExpr(arg) + ")"}, true
 	}
 	return nil, false
+}
+
+func parseResponseJSONTypeSend(expr string) (string, string, bool) {
+	status := "200"
+	rest := strings.TrimSpace(expr)
+	if strings.HasPrefix(rest, "res.status(") {
+		open := strings.IndexByte(rest, '(')
+		close := findMatching(rest, open, '(', ')')
+		if close < 0 {
+			return "", "", false
+		}
+		status = strings.TrimSpace(rest[open+1 : close])
+		rest = "res" + strings.TrimSpace(rest[close+1:])
+	}
+	name, ok := parseJSONTypeSend(rest)
+	return status, name, ok
 }
 
 func parseResponseTextCall(expr string) (string, string, string, bool) {
@@ -2131,6 +2159,17 @@ func (c *gopressBodyContext) compileReturnObjectLiteral(expr string) (string, bo
 
 func (c *gopressBodyContext) compileFastResponseChain(expr string) (string, bool) {
 	expr = strings.TrimSpace(expr)
+	if status, name, ok := parseResponseJSONTypeSend(expr); ok {
+		if _, ok := c.byteBuffers[name]; ok {
+			return "res.Status(" + status + ").JSONBytes(" + name + ")", true
+		}
+		if c.builders[name] {
+			return "res.Status(" + status + ").JSONString(" + name + ".String())", true
+		}
+		if local, ok := c.locals[name]; ok && local.kind == "string" {
+			return "res.Status(" + status + ").JSONString(" + name + ")", true
+		}
+	}
 	if name, ok := parseJSONTypeSend(expr); ok {
 		if _, ok := c.byteBuffers[name]; ok {
 			return "res.JSONBytes(" + name + ")", true
