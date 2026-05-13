@@ -65,6 +65,46 @@ export default app
 	}
 }
 
+func TestGopressRawParamUsesDirectTwoParamHandler(t *testing.T) {
+	src := []byte(`
+import gopress, { Request, Response } from "gopress"
+
+const app = gopress()
+
+app.get("/users/:userId/notes/:noteId", async (req: Request, res: Response) => {
+  return res.status(200).json({ userId: req.params.userId, noteId: req.params.noteId })
+})
+
+export default app
+`)
+
+	result := compiler.CompileFile("app.ts", src, config.Default().WithFramework("gopress").WithPackage("main"))
+	if result.Diagnostics.HasErrors() {
+		t.Fatalf("unexpected diagnostics:\n%s", result.Diagnostics.String())
+	}
+	for _, want := range []string{
+		`app.HandleRawParams2("GET", "/users/:userId/notes/:noteId", "userId", "noteId", func(w http.ResponseWriter, request *http.Request, param0 string, param1 string) error {`,
+		`godeJSON = strconv.AppendQuote(godeJSON, param0)`,
+		`godeJSON = strconv.AppendQuote(godeJSON, param1)`,
+		`return gopress.WriteJSONBytes(w, 200, godeJSON)`,
+	} {
+		if !strings.Contains(result.Go, want) {
+			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
+		}
+	}
+	for _, unwanted := range []string{
+		`app.HandleRawParams("GET", "/users/:userId/notes/:noteId"`,
+		`params.Get("userId")`,
+		`params.Get("noteId")`,
+		`req.Param("userId")`,
+		`req.Param("noteId")`,
+	} {
+		if strings.Contains(result.Go, unwanted) {
+			t.Fatalf("generated Go should not contain %q:\n%s", unwanted, result.Go)
+		}
+	}
+}
+
 func TestGopressInlineFastHandlerDoesNotEmitUnreachableReturnNil(t *testing.T) {
 	src := []byte(`
 import gopress, { Request, Response } from "gopress"

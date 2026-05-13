@@ -78,6 +78,7 @@ type gopressBodyContext struct {
 	directParams   bool
 	rawParams      bool
 	rawSingleParam string
+	rawParamNames  []string
 	rawRequest     bool
 	rawResponse    bool
 	jsonVarCount   int
@@ -94,6 +95,7 @@ type gopressBodyOptions struct {
 	rawResponse    bool
 	rawParams      bool
 	rawSingleParam string
+	rawParamNames  []string
 	rawRequest     bool
 	helperShapes   map[string]*gopressReturnObject
 	returnObject   *gopressReturnObject
@@ -867,11 +869,16 @@ func (a *gopressApp) emitGopressCall(ctx *gopressEmitContext, call gopressCall) 
 			return nil
 		}
 		if len(call.Args) == 2 {
-			if raw, paramName, ok := a.compileInlineRawSingleParamHandler(ctx, call.Args[1]); ok {
-				return []string{fmt.Sprintf("%s.HandleRawParam(%q, %s, %q, %s)", call.Receiver, strings.ToUpper(method), call.Args[0], paramName, raw)}
-			}
-			if raw, ok := a.compileInlineRawParamHandler(ctx, call.Args[1]); ok {
-				return []string{fmt.Sprintf("%s.HandleRawParams(%q, %s, %s)", call.Receiver, strings.ToUpper(method), call.Args[0], raw)}
+			if strings.Contains(call.Args[1], "req.params.") {
+				if raw, paramName, ok := a.compileInlineRawSingleParamHandler(ctx, call.Args[1]); ok {
+					return []string{fmt.Sprintf("%s.HandleRawParam(%q, %s, %q, %s)", call.Receiver, strings.ToUpper(method), call.Args[0], paramName, raw)}
+				}
+				if raw, firstParam, secondParam, ok := a.compileInlineRawTwoParamHandler(ctx, call.Args[1]); ok {
+					return []string{fmt.Sprintf("%s.HandleRawParams2(%q, %s, %q, %q, %s)", call.Receiver, strings.ToUpper(method), call.Args[0], firstParam, secondParam, raw)}
+				}
+				if raw, ok := a.compileInlineRawParamHandler(ctx, call.Args[1]); ok {
+					return []string{fmt.Sprintf("%s.HandleRawParams(%q, %s, %s)", call.Receiver, strings.ToUpper(method), call.Args[0], raw)}
+				}
 			}
 			if raw, ok := a.compileInlineRawHandler(ctx, call.Args[1]); ok {
 				return []string{fmt.Sprintf("%s.HandleRaw(%q, %s, %s)", call.Receiver, strings.ToUpper(method), call.Args[0], raw)}
@@ -891,11 +898,16 @@ func (a *gopressApp) emitGopressCall(ctx *gopressEmitContext, call gopressCall) 
 		}
 		routeMethod := strings.TrimPrefix(method, "route.")
 		if len(call.Args) == 2 {
-			if raw, paramName, ok := a.compileInlineRawSingleParamHandler(ctx, call.Args[1]); ok {
-				return []string{fmt.Sprintf("%s.HandleRawParam(%q, %s, %q, %s)", call.Receiver, strings.ToUpper(routeMethod), call.Args[0], paramName, raw)}
-			}
-			if raw, ok := a.compileInlineRawParamHandler(ctx, call.Args[1]); ok {
-				return []string{fmt.Sprintf("%s.HandleRawParams(%q, %s, %s)", call.Receiver, strings.ToUpper(routeMethod), call.Args[0], raw)}
+			if strings.Contains(call.Args[1], "req.params.") {
+				if raw, paramName, ok := a.compileInlineRawSingleParamHandler(ctx, call.Args[1]); ok {
+					return []string{fmt.Sprintf("%s.HandleRawParam(%q, %s, %q, %s)", call.Receiver, strings.ToUpper(routeMethod), call.Args[0], paramName, raw)}
+				}
+				if raw, firstParam, secondParam, ok := a.compileInlineRawTwoParamHandler(ctx, call.Args[1]); ok {
+					return []string{fmt.Sprintf("%s.HandleRawParams2(%q, %s, %q, %q, %s)", call.Receiver, strings.ToUpper(routeMethod), call.Args[0], firstParam, secondParam, raw)}
+				}
+				if raw, ok := a.compileInlineRawParamHandler(ctx, call.Args[1]); ok {
+					return []string{fmt.Sprintf("%s.HandleRawParams(%q, %s, %s)", call.Receiver, strings.ToUpper(routeMethod), call.Args[0], raw)}
+				}
 			}
 			if raw, ok := a.compileInlineRawHandler(ctx, call.Args[1]); ok {
 				return []string{fmt.Sprintf("%s.HandleRaw(%q, %s, %s)", call.Receiver, strings.ToUpper(routeMethod), call.Args[0], raw)}
@@ -1100,6 +1112,70 @@ func rawSingleParamName(src string) (string, bool) {
 		return "", false
 	}
 	return name, true
+}
+
+func rawTwoParamNames(src string) (string, string, bool) {
+	if !canCompileRawParamHandler(src) {
+		return "", "", false
+	}
+	var names [2]string
+	count := 0
+	for _, match := range gopressRequestMemberRE.FindAllStringSubmatch(src, -1) {
+		if len(match) < 3 || match[1] != "params" {
+			continue
+		}
+		name := match[2]
+		seen := false
+		for idx := 0; idx < count; idx++ {
+			if names[idx] == name {
+				seen = true
+				break
+			}
+		}
+		if seen {
+			continue
+		}
+		if count == len(names) {
+			return "", "", false
+		}
+		names[count] = name
+		count++
+	}
+	if count != 2 {
+		return "", "", false
+	}
+	return names[0], names[1], true
+}
+
+func (a *gopressApp) compileInlineRawTwoParamHandler(ctx *gopressEmitContext, src string) (string, string, string, bool) {
+	firstParam, secondParam, ok := rawTwoParamNames(src)
+	if !ok {
+		return "", "", "", false
+	}
+	bodyStart := strings.Index(src, "{")
+	bodyEnd := strings.LastIndex(src, "}")
+	if bodyStart < 0 || bodyEnd < bodyStart {
+		return "", "", "", false
+	}
+	body := src[bodyStart+1 : bodyEnd]
+	rawCtx := newGopressEmitContext()
+	lines, bodyDiags := compileGopressBodyWithOptions(rawCtx, a.path, body, nil, gopressBodyOptions{
+		rawResponse:   true,
+		rawParamNames: []string{firstParam, secondParam},
+		rawRequest:    true,
+		helperShapes:  a.helperShapes,
+	})
+	if bodyDiags.HasErrors() {
+		return "", "", "", false
+	}
+	rawLines, ok := rewriteRawHandlerLines(lines)
+	if !ok {
+		return "", "", "", false
+	}
+	ctx.merge(rawCtx)
+	a.diags = append(a.diags, bodyDiags...)
+	ctx.addImport("net/http")
+	return formatGopressFunc("func(w http.ResponseWriter, request *http.Request, param0 string, param1 string) error", rawLines), firstParam, secondParam, true
 }
 
 func (a *gopressApp) compileInlineRawParamHandler(ctx *gopressEmitContext, src string) (string, bool) {
@@ -1409,6 +1485,7 @@ func compileGopressBodyWithOptions(ctx *gopressEmitContext, path string, body st
 		directParams:   options.directParams,
 		rawParams:      options.rawParams,
 		rawSingleParam: options.rawSingleParam,
+		rawParamNames:  options.rawParamNames,
 		rawRequest:     options.rawRequest,
 		rawResponse:    options.rawResponse,
 	}
@@ -2623,19 +2700,24 @@ func (c *gopressBodyContext) replaceBuilderRefs(expr string) string {
 }
 
 func compileRequestMember(expr string) string {
-	return replaceRequestMembers(expr, false, false, "", false)
+	return replaceRequestMembers(expr, false, false, "", nil, false)
 }
 
 func (c *gopressBodyContext) replaceRequestMembers(expr string) string {
-	return replaceRequestMembers(expr, c.directParams, c.rawParams, c.rawSingleParam, c.rawRequest)
+	return replaceRequestMembers(expr, c.directParams, c.rawParams, c.rawSingleParam, c.rawParamNames, c.rawRequest)
 }
 
-func replaceRequestMembers(expr string, directParams bool, rawParams bool, rawSingleParam string, rawRequest bool) string {
+func replaceRequestMembers(expr string, directParams bool, rawParams bool, rawSingleParam string, rawParamNames []string, rawRequest bool) string {
 	expr = gopressRequestMemberRE.ReplaceAllStringFunc(expr, func(match string) string {
 		parts := strings.Split(match, ".")
 		key := parts[2]
 		switch parts[1] {
 		case "params":
+			for idx, name := range rawParamNames {
+				if key == name {
+					return fmt.Sprintf("param%d", idx)
+				}
+			}
 			if rawSingleParam != "" && key == rawSingleParam {
 				return "param"
 			}
