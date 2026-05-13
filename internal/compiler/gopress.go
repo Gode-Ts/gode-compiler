@@ -18,14 +18,15 @@ import (
 )
 
 type gopressApp struct {
-	packageName string
-	path        string
-	appName     string
-	vars        map[string]string
-	helpers     []gopressFunction
-	handlers    []gopressHandler
-	calls       []gopressCall
-	diags       diagnostics.List
+	packageName  string
+	path         string
+	appName      string
+	vars         map[string]string
+	helpers      []gopressFunction
+	helperShapes map[string]*gopressReturnObject
+	handlers     []gopressHandler
+	calls        []gopressCall
+	diags        diagnostics.List
 }
 
 type gopressHandler struct {
@@ -36,10 +37,11 @@ type gopressHandler struct {
 }
 
 type gopressFunction struct {
-	Name       string
-	Params     []gopressParam
-	Body       string
-	ReturnType string
+	Name         string
+	Params       []gopressParam
+	Body         string
+	ReturnType   string
+	ReturnObject *gopressReturnObject
 }
 
 type gopressParam struct {
@@ -70,15 +72,36 @@ type gopressBodyContext struct {
 	builders     map[string]bool
 	byteBuffers  map[string]int
 	locals       map[string]gopressLocal
+	helperShapes map[string]*gopressReturnObject
+	returnObject *gopressReturnObject
 	directParams bool
+	rawResponse  bool
+	jsonVarCount int
 }
 
 type gopressLocal struct {
-	kind string
+	kind   string
+	object *gopressReturnObject
 }
 
 type gopressBodyOptions struct {
 	directParams bool
+	rawResponse  bool
+	helperShapes map[string]*gopressReturnObject
+	returnObject *gopressReturnObject
+}
+
+type gopressReturnObject struct {
+	StructName string
+	Fields     []gopressObjectField
+}
+
+type gopressObjectField struct {
+	Key     string
+	GoName  string
+	GoType  string
+	Expr    string
+	Dynamic bool
 }
 
 type gopressFastRequestUse struct {
@@ -151,6 +174,12 @@ func parseGopress(path string, src string, cfg config.Config) *gopressApp {
 	}
 	app.handlers = parseGopressHandlers(src)
 	app.helpers = parseGopressHelperFunctions(src, app.handlers)
+	app.helperShapes = map[string]*gopressReturnObject{}
+	for _, helper := range app.helpers {
+		if helper.ReturnObject != nil {
+			app.helperShapes[helper.Name] = helper.ReturnObject
+		}
+	}
 	handlerSpans := findFunctionSpans(src)
 	for _, call := range scanGopressCalls(src, handlerSpans) {
 		if _, ok := app.vars[call.Receiver]; !ok {
@@ -206,11 +235,17 @@ func parseGopressHelperFunctions(src string, handlers []gopressHandler) []gopres
 		}
 		body := src[open+1 : close]
 		parsedParams := optimizeGopressParams(parseGopressParams(params), body)
+		returnObject := inferGopressReturnObject(name, body, parsedParams)
+		returnType := inferGopressReturnType(declaredReturn, body)
+		if returnObject != nil {
+			returnType = returnObject.StructName
+		}
 		functions = append(functions, gopressFunction{
-			Name:       name,
-			Params:     parsedParams,
-			Body:       body,
-			ReturnType: inferGopressReturnType(declaredReturn, body),
+			Name:         name,
+			Params:       parsedParams,
+			Body:         body,
+			ReturnType:   returnType,
+			ReturnObject: returnObject,
 		})
 	}
 	return functions
@@ -284,6 +319,253 @@ func inferGopressReturnType(declared string, body string) string {
 		return "any"
 	}
 	return ""
+}
+
+func inferGopressReturnObject(name string, body string, params []gopressParam) *gopressReturnObject {
+	expr, ok := findGopressReturnObject(body)
+	if !ok {
+		return nil
+	}
+	fields, ok := parseGopressObjectFields(expr)
+	if !ok || len(fields) == 0 {
+		return nil
+	}
+	locals := inferGopressLocalKinds(body, params, nil)
+	object := &gopressReturnObject{StructName: name + "Result", Fields: make([]gopressObjectField, 0, len(fields))}
+	for _, field := range fields {
+		if field.Dynamic {
+			return nil
+		}
+		goName := names.Local(field.Key)
+		if !isGoIdentifier(goName) {
+			return nil
+		}
+		goType := inferGopressGoType(field.Expr, locals)
+		if goType == "" || goType == "any" {
+			return nil
+		}
+		object.Fields = append(object.Fields, gopressObjectField{
+			Key:    field.Key,
+			GoName: goName,
+			GoType: goType,
+			Expr:   field.Expr,
+		})
+	}
+	return object
+}
+
+func findGopressReturnObject(body string) (string, bool) {
+	for pos := 0; pos < len(body); {
+		pos = skipGopressSeparators(body, pos)
+		if pos >= len(body) {
+			break
+		}
+		if hasKeywordAt(body, pos, "if") || hasKeywordAt(body, pos, "for") {
+			open := strings.IndexByte(body[pos:], '{')
+			if open < 0 {
+				return "", false
+			}
+			open += pos
+			close := findMatching(body, open, '{', '}')
+			if close < 0 {
+				return "", false
+			}
+			pos = close + 1
+			continue
+		}
+		stmt, next := readGopressStatement(body, pos)
+		trimmed := strings.TrimSpace(strings.TrimSuffix(stmt, ";"))
+		if strings.HasPrefix(trimmed, "return ") {
+			expr := strings.TrimSpace(strings.TrimPrefix(trimmed, "return "))
+			if strings.HasPrefix(expr, "{") {
+				return expr, true
+			}
+			return "", false
+		}
+		pos = next
+	}
+	return "", false
+}
+
+type gopressObjectFieldExpr struct {
+	Key     string
+	Expr    string
+	Dynamic bool
+}
+
+func parseGopressObjectFields(expr string) ([]gopressObjectFieldExpr, bool) {
+	expr = strings.TrimSpace(expr)
+	if !strings.HasPrefix(expr, "{") {
+		return nil, false
+	}
+	close := findMatching(expr, 0, '{', '}')
+	if close != len(expr)-1 {
+		return nil, false
+	}
+	body := strings.TrimSpace(expr[1:close])
+	if body == "" {
+		return nil, true
+	}
+	parts := splitTopLevelArgs(body)
+	fields := make([]gopressObjectFieldExpr, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if strings.HasPrefix(part, "...") {
+			fields = append(fields, gopressObjectFieldExpr{Expr: strings.TrimSpace(strings.TrimPrefix(part, "...")), Dynamic: true})
+			continue
+		}
+		key := ""
+		value := ""
+		if idx := findTopLevelColon(part); idx >= 0 {
+			key = strings.Trim(strings.TrimSpace(part[:idx]), `"'`)
+			value = strings.TrimSpace(part[idx+1:])
+		} else {
+			key = strings.Trim(strings.TrimSpace(part), `"'`)
+			value = part
+		}
+		if key == "" || value == "" {
+			return nil, false
+		}
+		fields = append(fields, gopressObjectFieldExpr{Key: key, Expr: value})
+	}
+	return fields, true
+}
+
+func inferGopressLocalKinds(body string, params []gopressParam, helperShapes map[string]*gopressReturnObject) map[string]gopressLocal {
+	locals := map[string]gopressLocal{}
+	for _, param := range params {
+		locals[param.Name] = gopressLocal{kind: param.GoType}
+	}
+	for pos := 0; pos < len(body); {
+		pos = skipGopressSeparators(body, pos)
+		if pos >= len(body) {
+			break
+		}
+		if hasKeywordAt(body, pos, "for") {
+			openHeader := skipSpace(body, pos+len("for"))
+			closeHeader := -1
+			if openHeader < len(body) && body[openHeader] == '(' {
+				closeHeader = findMatching(body, openHeader, '(', ')')
+			}
+			openBody := -1
+			closeBody := -1
+			if closeHeader >= 0 {
+				openBody = skipSpace(body, closeHeader+1)
+				if openBody < len(body) && body[openBody] == '{' {
+					closeBody = findMatching(body, openBody, '{', '}')
+				}
+			}
+			if closeHeader > openHeader {
+				parts := splitTopLevelSemicolons(body[openHeader+1 : closeHeader])
+				if len(parts) == 3 {
+					recordGopressVarKind(parts[0], locals, helperShapes)
+				}
+			}
+			if closeBody >= 0 {
+				pos = closeBody + 1
+				continue
+			}
+		}
+		stmt, next := readGopressStatement(body, pos)
+		recordGopressVarKind(stmt, locals, helperShapes)
+		pos = next
+	}
+	return locals
+}
+
+func recordGopressVarKind(stmt string, locals map[string]gopressLocal, helperShapes map[string]*gopressReturnObject) {
+	name, expr, ok := parseGopressVarDecl(stmt)
+	if !ok {
+		return
+	}
+	local := gopressLocal{kind: inferGopressGoType(expr, locals)}
+	if shape := helperShapeForCall(expr, helperShapes); shape != nil {
+		local.kind = "object"
+		local.object = shape
+	}
+	locals[name] = local
+}
+
+func parseGopressVarDecl(stmt string) (string, string, bool) {
+	stmt = strings.TrimSpace(strings.TrimSuffix(stmt, ";"))
+	for _, keyword := range []string{"const", "let", "var"} {
+		if !hasKeywordAt(stmt, 0, keyword) {
+			continue
+		}
+		rest := strings.TrimSpace(stmt[len(keyword):])
+		namePart, expr, hasValue := strings.Cut(rest, "=")
+		if !hasValue {
+			return "", "", false
+		}
+		name, _, _ := strings.Cut(strings.TrimSpace(namePart), ":")
+		name = strings.TrimSpace(strings.TrimSuffix(name, "?"))
+		expr = strings.TrimSpace(expr)
+		return name, expr, name != "" && expr != ""
+	}
+	return "", "", false
+}
+
+func inferGopressGoType(expr string, locals map[string]gopressLocal) string {
+	expr = strings.TrimSpace(expr)
+	switch {
+	case isStringLiteral(expr):
+		return "string"
+	case isIntegerLiteral(expr):
+		return "int"
+	case isNumberLiteral(expr):
+		return "float64"
+	case expr == "true" || expr == "false":
+		return "bool"
+	case expr == "performance.now()":
+		return "time"
+	case strings.HasPrefix(expr, "performance.now() -"):
+		return "float64"
+	}
+	if local, ok := locals[expr]; ok {
+		return local.kind
+	}
+	return ""
+}
+
+func helperShapeForCall(expr string, helperShapes map[string]*gopressReturnObject) *gopressReturnObject {
+	if len(helperShapes) == 0 {
+		return nil
+	}
+	expr = strings.TrimSpace(expr)
+	open := strings.IndexByte(expr, '(')
+	if open <= 0 || !strings.HasSuffix(expr, ")") {
+		return nil
+	}
+	name := strings.TrimSpace(expr[:open])
+	if !isGoIdentifier(name) {
+		return nil
+	}
+	close := findMatching(expr, open, '(', ')')
+	if close != len(expr)-1 {
+		return nil
+	}
+	return helperShapes[name]
+}
+
+func isGoIdentifier(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i, r := range name {
+		if i == 0 {
+			if !isIdentStartRune(r) {
+				return false
+			}
+			continue
+		}
+		if !isIdentPartRune(r) {
+			return false
+		}
+	}
+	return true
 }
 
 func findFunctionSpans(src string) [][2]int {
@@ -370,7 +652,10 @@ func (a *gopressApp) emit() (string, diagnostics.List) {
 		if helper.ReturnType != "" {
 			returnType = " " + helper.ReturnType
 		}
-		lines, bodyDiags := compileGopressBody(ctx, a.path, helper.Body, helper.Params)
+		lines, bodyDiags := compileGopressBodyWithOptions(ctx, a.path, helper.Body, helper.Params, gopressBodyOptions{
+			helperShapes: a.helperShapes,
+			returnObject: helper.ReturnObject,
+		})
 		a.diags = append(a.diags, bodyDiags...)
 		helperBlocks = append(helperBlocks, gopressRenderedFunc{
 			Header:     fmt.Sprintf("func %s(%s)%s {", helper.Name, strings.Join(params, ", "), returnType),
@@ -386,7 +671,7 @@ func (a *gopressApp) emit() (string, diagnostics.List) {
 		} else {
 			header = fmt.Sprintf("func %s(req *gopress.Request, res *gopress.Response, next gopress.NextFunc) error {", handler.GoName)
 		}
-		lines, bodyDiags := compileGopressBody(ctx, a.path, handler.Body, nil)
+		lines, bodyDiags := compileGopressBodyWithOptions(ctx, a.path, handler.Body, nil, gopressBodyOptions{helperShapes: a.helperShapes})
 		a.diags = append(a.diags, bodyDiags...)
 		handlerBlocks = append(handlerBlocks, gopressRenderedFunc{Header: header, Lines: lines})
 	}
@@ -423,6 +708,17 @@ func (a *gopressApp) emit() (string, diagnostics.List) {
 		w("}")
 		w("}")
 		w("return out")
+		w("}")
+		w("")
+	}
+	for _, helper := range a.helpers {
+		if helper.ReturnObject == nil {
+			continue
+		}
+		w("type %s struct {", helper.ReturnObject.StructName)
+		for _, field := range helper.ReturnObject.Fields {
+			w("%s %s", field.GoName, field.GoType)
+		}
 		w("}")
 		w("")
 	}
@@ -665,7 +961,7 @@ func (a *gopressApp) compileInlineHandler(ctx *gopressEmitContext, src string) s
 	if bodyStart < 0 || bodyEnd < bodyStart {
 		return "func(req *gopress.Request, res *gopress.Response, next gopress.NextFunc) error { return nil }"
 	}
-	lines, bodyDiags := compileGopressBody(ctx, a.path, src[bodyStart+1:bodyEnd], nil)
+	lines, bodyDiags := compileGopressBodyWithOptions(ctx, a.path, src[bodyStart+1:bodyEnd], nil, gopressBodyOptions{helperShapes: a.helperShapes})
 	a.diags = append(a.diags, bodyDiags...)
 	return formatGopressFunc("func(req *gopress.Request, res *gopress.Response, next gopress.NextFunc) error", lines)
 }
@@ -719,7 +1015,7 @@ func (a *gopressApp) compileInlineFastHandler(ctx *gopressEmitContext, src strin
 	if bodyStart < 0 || bodyEnd < bodyStart {
 		return "func(req *gopress.Request, res *gopress.Response) error { return nil }"
 	}
-	lines, bodyDiags := compileGopressBodyWithOptions(ctx, a.path, src[bodyStart+1:bodyEnd], nil, gopressBodyOptions{directParams: true})
+	lines, bodyDiags := compileGopressBodyWithOptions(ctx, a.path, src[bodyStart+1:bodyEnd], nil, gopressBodyOptions{directParams: true, helperShapes: a.helperShapes})
 	a.diags = append(a.diags, bodyDiags...)
 	return formatGopressFunc("func(req *gopress.Request, res *gopress.Response) error", lines)
 }
@@ -735,7 +1031,7 @@ func (a *gopressApp) compileInlineRawHandler(ctx *gopressEmitContext, src string
 	}
 	body := src[bodyStart+1 : bodyEnd]
 	rawCtx := newGopressEmitContext()
-	lines, bodyDiags := compileGopressBodyWithOptions(rawCtx, a.path, body, nil, gopressBodyOptions{})
+	lines, bodyDiags := compileGopressBodyWithOptions(rawCtx, a.path, body, nil, gopressBodyOptions{rawResponse: true, helperShapes: a.helperShapes})
 	if bodyDiags.HasErrors() {
 		return "", false
 	}
@@ -874,7 +1170,7 @@ func (a *gopressApp) compileInlineErrorHandler(ctx *gopressEmitContext, src stri
 	if bodyStart < 0 || bodyEnd < bodyStart {
 		return "func(err error, req *gopress.Request, res *gopress.Response, next gopress.NextFunc) error { return nil }"
 	}
-	lines, bodyDiags := compileGopressBody(ctx, a.path, src[bodyStart+1:bodyEnd], nil)
+	lines, bodyDiags := compileGopressBodyWithOptions(ctx, a.path, src[bodyStart+1:bodyEnd], nil, gopressBodyOptions{helperShapes: a.helperShapes})
 	a.diags = append(a.diags, bodyDiags...)
 	return formatGopressFunc("func(err error, req *gopress.Request, res *gopress.Response, next gopress.NextFunc) error", lines)
 }
@@ -914,7 +1210,17 @@ func compileGopressBodyWithOptions(ctx *gopressEmitContext, path string, body st
 	if len(builders) > 0 {
 		ctx.addImport("strings")
 	}
-	bodyCtx := &gopressBodyContext{emit: ctx, path: path, builders: builders, byteBuffers: byteBuffers, locals: map[string]gopressLocal{}, directParams: options.directParams}
+	bodyCtx := &gopressBodyContext{
+		emit:         ctx,
+		path:         path,
+		builders:     builders,
+		byteBuffers:  byteBuffers,
+		locals:       map[string]gopressLocal{},
+		helperShapes: options.helperShapes,
+		returnObject: options.returnObject,
+		directParams: options.directParams,
+		rawResponse:  options.rawResponse,
+	}
 	for _, param := range params {
 		bodyCtx.locals[param.Name] = gopressLocal{kind: param.GoType}
 	}
@@ -1048,9 +1354,25 @@ func (c *gopressBodyContext) compileStatement(stmt string) ([]string, diagnostic
 		return lines, nil
 	}
 	if strings.HasPrefix(stmt, "return ") {
-		return []string{"return " + c.compileExpr(strings.TrimSpace(strings.TrimPrefix(stmt, "return ")))}, nil
+		expr := strings.TrimSpace(strings.TrimPrefix(stmt, "return "))
+		if c.rawResponse && strings.HasPrefix(expr, "res.") {
+			if lines, ok := c.compileRawResponseStatement(expr); ok {
+				return lines, nil
+			}
+		}
+		if c.returnObject != nil && strings.HasPrefix(expr, "{") {
+			if compiled, ok := c.compileReturnObjectLiteral(expr); ok {
+				return []string{"return " + compiled}, nil
+			}
+		}
+		return []string{"return " + c.compileExpr(expr)}, nil
 	}
 	if strings.HasPrefix(stmt, "res.") || strings.HasPrefix(stmt, "next(") {
+		if c.rawResponse && strings.HasPrefix(stmt, "res.") {
+			if lines, ok := c.compileRawResponseStatement(stmt); ok {
+				return lines, nil
+			}
+		}
 		return []string{"return " + c.compileExpr(stmt)}, nil
 	}
 	if lines, ok := c.compileAssignment(stmt); ok {
@@ -1117,7 +1439,12 @@ func (c *gopressBodyContext) compileVarDecl(stmt string, forClause bool) ([]stri
 		return lines, true
 	}
 	compiled := c.compileExpr(expr)
-	c.locals[name] = gopressLocal{kind: c.inferLocalKind(expr)}
+	local := gopressLocal{kind: c.inferLocalKind(expr)}
+	if shape := helperShapeForCall(expr, c.helperShapes); shape != nil {
+		local.kind = "object"
+		local.object = shape
+	}
+	c.locals[name] = local
 	if keyword == "const" && !forClause && isGopressConstLiteral(expr) {
 		return []string{fmt.Sprintf("const %s = %s", name, compiled)}, true
 	}
@@ -1125,23 +1452,7 @@ func (c *gopressBodyContext) compileVarDecl(stmt string, forClause bool) ([]stri
 }
 
 func (c *gopressBodyContext) inferLocalKind(expr string) string {
-	expr = strings.TrimSpace(expr)
-	switch {
-	case isStringLiteral(expr):
-		return "string"
-	case isIntegerLiteral(expr):
-		return "int"
-	case isNumberLiteral(expr):
-		return "float64"
-	case expr == "true" || expr == "false":
-		return "bool"
-	case expr == "performance.now()":
-		return "time"
-	case strings.HasPrefix(expr, "performance.now() -"):
-		return "float64"
-	default:
-		return ""
-	}
+	return inferGopressGoType(expr, c.locals)
 }
 
 func (c *gopressBodyContext) compileAssignment(stmt string) ([]string, bool) {
@@ -1337,6 +1648,223 @@ func (c *gopressBodyContext) compileResponseChain(expr string) string {
 	out = c.replaceObjectArgs(out)
 	out = c.replaceBuilderRefs(out)
 	return out
+}
+
+func (c *gopressBodyContext) compileRawResponseStatement(expr string) ([]string, bool) {
+	expr = strings.TrimSpace(expr)
+	if status, arg, ok := parseResponseJSONCall(expr); ok {
+		if lines, ok := c.compileJSONByteResponse(status, arg); ok {
+			return lines, true
+		}
+		return []string{"return gopress.WriteJSON(w, " + status + ", " + c.compileExpr(arg) + ")"}, true
+	}
+	return nil, false
+}
+
+func parseResponseJSONCall(expr string) (string, string, bool) {
+	expr = strings.TrimSpace(expr)
+	if strings.HasPrefix(expr, "res.status(") {
+		openStatus := strings.IndexByte(expr, '(')
+		closeStatus := findMatching(expr, openStatus, '(', ')')
+		if closeStatus < 0 {
+			return "", "", false
+		}
+		rest := strings.TrimSpace(expr[closeStatus+1:])
+		if !strings.HasPrefix(rest, ".json(") {
+			return "", "", false
+		}
+		openJSON := closeStatus + strings.Index(expr[closeStatus+1:], "(") + 1
+		closeJSON := findMatching(expr, openJSON, '(', ')')
+		if closeJSON != len(expr)-1 {
+			return "", "", false
+		}
+		return strings.TrimSpace(expr[openStatus+1 : closeStatus]), strings.TrimSpace(expr[openJSON+1 : closeJSON]), true
+	}
+	if strings.HasPrefix(expr, "res.json(") {
+		open := strings.IndexByte(expr, '(')
+		close := findMatching(expr, open, '(', ')')
+		if close != len(expr)-1 {
+			return "", "", false
+		}
+		return "200", strings.TrimSpace(expr[open+1 : close]), true
+	}
+	return "", "", false
+}
+
+func (c *gopressBodyContext) compileJSONByteResponse(status string, expr string) ([]string, bool) {
+	fields, ok := c.flattenJSONFields(expr)
+	if !ok {
+		return nil, false
+	}
+	name := c.nextJSONVar()
+	lines := c.compileJSONByteFields(name, fields)
+	lines = append(lines, "return gopress.WriteJSONBytes(w, "+status+", "+name+")")
+	return lines, true
+}
+
+func (c *gopressBodyContext) nextJSONVar() string {
+	if c.jsonVarCount == 0 {
+		c.jsonVarCount++
+		return "godeJSON"
+	}
+	name := fmt.Sprintf("godeJSON%d", c.jsonVarCount)
+	c.jsonVarCount++
+	return name
+}
+
+func (c *gopressBodyContext) flattenJSONFields(expr string) ([]gopressObjectField, bool) {
+	parts, ok := parseGopressObjectFields(expr)
+	if !ok || len(parts) == 0 {
+		return nil, false
+	}
+	fields := make([]gopressObjectField, 0, len(parts))
+	for _, part := range parts {
+		if part.Dynamic {
+			local, ok := c.locals[part.Expr]
+			if !ok || local.object == nil {
+				return nil, false
+			}
+			for _, field := range local.object.Fields {
+				fields = append(fields, gopressObjectField{
+					Key:    field.Key,
+					GoName: field.GoName,
+					GoType: field.GoType,
+					Expr:   part.Expr + "." + field.GoName,
+				})
+			}
+			continue
+		}
+		goType := inferGopressGoType(part.Expr, c.locals)
+		if goType == "" {
+			goType = c.selectorGoType(part.Expr)
+		}
+		if goType == "" && isStringLiteral(part.Expr) {
+			goType = "string"
+		}
+		if goType == "" {
+			return nil, false
+		}
+		fields = append(fields, gopressObjectField{Key: part.Key, GoType: goType, Expr: part.Expr})
+	}
+	return fields, true
+}
+
+func (c *gopressBodyContext) compileJSONByteFields(name string, fields []gopressObjectField) []string {
+	lines := []string{fmt.Sprintf("%s := make([]byte, 0, %d)", name, estimateJSONFieldsCapacity(fields))}
+	literal := "{"
+	flushLiteral := func() {
+		if literal == "" {
+			return
+		}
+		lines = append(lines, fmt.Sprintf("%s = append(%s, %s...)", name, name, strconv.Quote(literal)))
+		literal = ""
+	}
+	for idx, field := range fields {
+		if idx > 0 {
+			literal += ","
+		}
+		keyJSON, err := json.Marshal(field.Key)
+		if err != nil {
+			keyJSON = []byte(strconv.Quote(field.Key))
+		}
+		literal += string(keyJSON) + ":"
+		if isStringLiteral(field.Expr) {
+			if value, err := strconv.Unquote(field.Expr); err == nil {
+				if data, err := json.Marshal(value); err == nil {
+					literal += string(data)
+					continue
+				}
+			}
+		}
+		flushLiteral()
+		lines = append(lines, c.compileJSONByteValueAppend(name, field.Expr, field.GoType))
+	}
+	literal += "}"
+	flushLiteral()
+	return lines
+}
+
+func estimateJSONFieldsCapacity(fields []gopressObjectField) int {
+	total := 2
+	for _, field := range fields {
+		total += len(field.Key) + 4 + 24
+		if isStringLiteral(field.Expr) {
+			if value, err := strconv.Unquote(field.Expr); err == nil {
+				total += len(value)
+			}
+		}
+	}
+	if total < 32 {
+		return 32
+	}
+	return total
+}
+
+func (c *gopressBodyContext) compileJSONByteValueAppend(name string, expr string, goType string) string {
+	expr = strings.TrimSpace(expr)
+	compiled := c.compileExpr(expr)
+	if goType == "" {
+		goType = inferGopressGoType(expr, c.locals)
+	}
+	if goType == "" {
+		goType = c.selectorGoType(expr)
+	}
+	switch goType {
+	case "string":
+		c.emit.addImport("strconv")
+		return fmt.Sprintf("%s = strconv.AppendQuote(%s, %s)", name, name, compiled)
+	case "int":
+		c.emit.addImport("strconv")
+		return fmt.Sprintf("%s = strconv.AppendInt(%s, int64(%s), 10)", name, name, compiled)
+	case "float64":
+		c.emit.addImport("strconv")
+		return fmt.Sprintf("%s = strconv.AppendFloat(%s, %s, 'f', -1, 64)", name, name, compiled)
+	case "bool":
+		c.emit.addImport("strconv")
+		return fmt.Sprintf("%s = strconv.AppendBool(%s, %s)", name, name, compiled)
+	default:
+		return fmt.Sprintf("%s = append(%s, \"null\"...)", name, name)
+	}
+}
+
+func (c *gopressBodyContext) selectorGoType(expr string) string {
+	left, right, ok := strings.Cut(strings.TrimSpace(expr), ".")
+	if !ok || left == "" || right == "" || strings.Contains(right, ".") {
+		return ""
+	}
+	local, ok := c.locals[left]
+	if !ok || local.object == nil {
+		return ""
+	}
+	for _, field := range local.object.Fields {
+		if field.GoName == right {
+			return field.GoType
+		}
+	}
+	return ""
+}
+
+func (c *gopressBodyContext) compileReturnObjectLiteral(expr string) (string, bool) {
+	fields, ok := parseGopressObjectFields(expr)
+	if !ok || len(fields) != len(c.returnObject.Fields) {
+		return "", false
+	}
+	values := make(map[string]string, len(fields))
+	for _, field := range fields {
+		if field.Dynamic {
+			return "", false
+		}
+		values[field.Key] = field.Expr
+	}
+	parts := make([]string, 0, len(c.returnObject.Fields))
+	for _, field := range c.returnObject.Fields {
+		expr, ok := values[field.Key]
+		if !ok {
+			return "", false
+		}
+		parts = append(parts, fmt.Sprintf("%s: %s", field.GoName, c.compileExpr(expr)))
+	}
+	return c.returnObject.StructName + "{" + strings.Join(parts, ", ") + "}", true
 }
 
 func (c *gopressBodyContext) compileFastResponseChain(expr string) (string, bool) {

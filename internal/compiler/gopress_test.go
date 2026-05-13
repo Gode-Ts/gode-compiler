@@ -231,29 +231,91 @@ export default app
 	}
 	for _, want := range []string{
 		`"time"`,
-		"func runLoop(iterations int) map[string]any",
+		`"strconv"`,
+		"type runLoopResult struct",
+		"func runLoop(iterations int) runLoopResult",
 		"sum := 0",
 		"for i := 0; i < iterations; i++ {",
 		"sum += i",
-		`return map[string]any{"iterations": iterations, "sum": sum}`,
+		"return runLoopResult{iterations: iterations, sum: sum}",
 		"const iterations = 1000000",
 		"start := time.Now()",
 		"result := runLoop(iterations)",
 		"durationMs := float64(time.Since(start).Microseconds()) / 1000.0",
 		`app.HandleRaw("GET", "/bench", func(w http.ResponseWriter, request *http.Request) error {`,
-		`return gopress.WriteJSON(w, 200, godeMergeJSON(map[string]any{"runtime": "gopress", "durationMs": durationMs}, result))`,
-		"func godeMergeJSON(parts ...map[string]any) map[string]any",
+		"godeJSON := make([]byte, 0, ",
+		`godeJSON = append(godeJSON, "{\"runtime\":\"gopress\",\"durationMs\":"...)`,
+		`godeJSON = strconv.AppendFloat(godeJSON, durationMs, 'f', -1, 64)`,
+		`godeJSON = append(godeJSON, ",\"iterations\":"...)`,
+		`godeJSON = strconv.AppendInt(godeJSON, int64(result.iterations), 10)`,
+		`godeJSON = append(godeJSON, ",\"sum\":"...)`,
+		`godeJSON = strconv.AppendInt(godeJSON, int64(result.sum), 10)`,
+		`return gopress.WriteJSONBytes(w, 200, godeJSON)`,
 	} {
 		if !strings.Contains(result.Go, want) {
 			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
 		}
 	}
-	if strings.Contains(result.Go, `"strconv"`) {
-		t.Fatalf("spread fallback should not leave unused strconv import:\n%s", result.Go)
+	for _, unwanted := range []string{
+		"func godeMergeJSON(parts ...map[string]any) map[string]any",
+		"godeMergeJSON(",
+		"map[string]any",
+		"gopress.WriteJSON(w, 200",
+		"res.StatusJSON(",
+	} {
+		if strings.Contains(result.Go, unwanted) {
+			t.Fatalf("generated Go should not contain %q:\n%s", unwanted, result.Go)
+		}
 	}
 	if strings.Contains(result.Go, `return map[string]any{"iterations": iterations, "sum": sum}
 	return nil`) {
 		t.Fatalf("generated helper should not include unreachable return nil:\n%s", result.Go)
+	}
+}
+
+func TestGopressKnownObjectJSONUsesByteWriter(t *testing.T) {
+	src := []byte(`
+import gopress, { Request, Response } from "gopress"
+
+const app = gopress()
+
+app.get("/metrics", async (req: Request, res: Response) => {
+  const count = 42
+  const name = "gode"
+  return res.status(201).json({ ok: true, count, name })
+})
+
+export default app
+`)
+
+	result := compiler.CompileFile("app.ts", src, config.Default().WithFramework("gopress").WithPackage("main"))
+	if result.Diagnostics.HasErrors() {
+		t.Fatalf("unexpected diagnostics:\n%s", result.Diagnostics.String())
+	}
+	for _, want := range []string{
+		`app.HandleRaw("GET", "/metrics", func(w http.ResponseWriter, request *http.Request) error {`,
+		`godeJSON := make([]byte, 0, `,
+		`godeJSON = append(godeJSON, "{\"ok\":"...)`,
+		`godeJSON = strconv.AppendBool(godeJSON, true)`,
+		`godeJSON = append(godeJSON, ",\"count\":"...)`,
+		`godeJSON = strconv.AppendInt(godeJSON, int64(count), 10)`,
+		`godeJSON = append(godeJSON, ",\"name\":"...)`,
+		`godeJSON = strconv.AppendQuote(godeJSON, name)`,
+		`return gopress.WriteJSONBytes(w, 201, godeJSON)`,
+	} {
+		if !strings.Contains(result.Go, want) {
+			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
+		}
+	}
+	for _, unwanted := range []string{
+		"res.StatusJSON(",
+		`" + "`,
+		"map[string]any",
+		"gopress.WriteJSON(w, 201",
+	} {
+		if strings.Contains(result.Go, unwanted) {
+			t.Fatalf("generated Go should not contain %q:\n%s", unwanted, result.Go)
+		}
 	}
 }
 
