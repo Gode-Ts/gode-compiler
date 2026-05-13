@@ -127,14 +127,14 @@ export default app
 	}
 }
 
-func TestGopressInlineHandlerWithQueryUsesCompatibleRequestPath(t *testing.T) {
+func TestGopressInlineHandlerWithQueryUsesRawRequestPath(t *testing.T) {
 	src := []byte(`
 import gopress, { Request, Response } from "gopress"
 
 const app = gopress()
 
 app.get("/search", async (req: Request, res: Response) => {
-  return res.send(req.query.page)
+  return res.status(200).json({ page: req.query.page })
 })
 
 export default app
@@ -144,11 +144,27 @@ export default app
 	if result.Diagnostics.HasErrors() {
 		t.Fatalf("unexpected diagnostics:\n%s", result.Diagnostics.String())
 	}
-	if !strings.Contains(result.Go, `app.HandleFastOptions("GET", "/search", gopress.FastRequestOptions{Query: true}, func(req *gopress.Request, res *gopress.Response) error {`) {
-		t.Fatalf("handler that reads req.query should use selective fast request path:\n%s", result.Go)
+	for _, want := range []string{
+		`"net/http"`,
+		`app.HandleRaw("GET", "/search", func(w http.ResponseWriter, request *http.Request) error {`,
+		`godeJSON := make([]byte, 0, `,
+		`godeJSON = append(godeJSON, "{\"page\":"...)`,
+		`godeJSON = strconv.AppendQuote(godeJSON, gopress.QueryValue(request, "page"))`,
+		`return gopress.WriteJSONBytes(w, 200, godeJSON)`,
+	} {
+		if !strings.Contains(result.Go, want) {
+			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
+		}
 	}
-	if strings.Contains(result.Go, `app.Get("/search"`) {
-		t.Fatalf("handler that reads req.query should not fall back to compatible request path:\n%s", result.Go)
+	for _, unwanted := range []string{
+		"app.HandleFastOptions(",
+		`app.Get("/search"`,
+		"req.Query",
+		"res.Status(200).JSONBytes(",
+	} {
+		if strings.Contains(result.Go, unwanted) {
+			t.Fatalf("generated Go should not contain %q:\n%s", unwanted, result.Go)
+		}
 	}
 }
 

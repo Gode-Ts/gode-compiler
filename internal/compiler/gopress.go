@@ -76,6 +76,7 @@ type gopressBodyContext struct {
 	returnObject *gopressReturnObject
 	directParams bool
 	rawParams    bool
+	rawRequest   bool
 	rawResponse  bool
 	jsonVarCount int
 }
@@ -89,6 +90,7 @@ type gopressBodyOptions struct {
 	directParams bool
 	rawResponse  bool
 	rawParams    bool
+	rawRequest   bool
 	helperShapes map[string]*gopressReturnObject
 	returnObject *gopressReturnObject
 }
@@ -1039,6 +1041,7 @@ func (a *gopressApp) compileInlineRawParamHandler(ctx *gopressEmitContext, src s
 	lines, bodyDiags := compileGopressBodyWithOptions(rawCtx, a.path, body, nil, gopressBodyOptions{
 		rawResponse:  true,
 		rawParams:    true,
+		rawRequest:   true,
 		helperShapes: a.helperShapes,
 	})
 	if bodyDiags.HasErrors() {
@@ -1062,7 +1065,10 @@ func canCompileRawParamHandler(src string) bool {
 	if !strings.Contains(trimmed, "req.params.") {
 		return false
 	}
-	for _, unsupported := range []string{"req.query", "req.body", "req.headers", "req.cookies", "req.method", "req.path", "res.set(", "res.cookie(", "res.redirect(", "res.sendFile(", "res.sendStatus("} {
+	if !rawRequestUsageSupported(trimmed, true) {
+		return false
+	}
+	for _, unsupported := range []string{"req.body", "res.set(", "res.cookie(", "res.redirect(", "res.sendFile(", "res.sendStatus("} {
 		if strings.Contains(trimmed, unsupported) {
 			return false
 		}
@@ -1081,7 +1087,7 @@ func (a *gopressApp) compileInlineRawHandler(ctx *gopressEmitContext, src string
 	}
 	body := src[bodyStart+1 : bodyEnd]
 	rawCtx := newGopressEmitContext()
-	lines, bodyDiags := compileGopressBodyWithOptions(rawCtx, a.path, body, nil, gopressBodyOptions{rawResponse: true, helperShapes: a.helperShapes})
+	lines, bodyDiags := compileGopressBodyWithOptions(rawCtx, a.path, body, nil, gopressBodyOptions{rawResponse: true, rawRequest: true, helperShapes: a.helperShapes})
 	if bodyDiags.HasErrors() {
 		return "", false
 	}
@@ -1097,7 +1103,10 @@ func (a *gopressApp) compileInlineRawHandler(ctx *gopressEmitContext, src string
 
 func canCompileRawHandler(src string) bool {
 	trimmed := strings.TrimSpace(src)
-	if !strings.Contains(trimmed, "=>") || strings.Contains(trimmed, "req.") || strings.Contains(trimmed, "next") || isErrorArrow(trimmed) {
+	if !strings.Contains(trimmed, "=>") || strings.Contains(trimmed, "next") || isErrorArrow(trimmed) {
+		return false
+	}
+	if !rawRequestUsageSupported(trimmed, false) {
 		return false
 	}
 	for _, unsupported := range []string{"res.set(", "res.cookie(", "res.redirect(", "res.sendFile(", "res.sendStatus("} {
@@ -1106,6 +1115,60 @@ func canCompileRawHandler(src string) bool {
 		}
 	}
 	return strings.Contains(trimmed, "res.")
+}
+
+func rawRequestUsageSupported(src string, allowParams bool) bool {
+	for offset := 0; offset < len(src); {
+		idx := strings.Index(src[offset:], "req.")
+		if idx < 0 {
+			return true
+		}
+		pos := offset + idx + len("req.")
+		rest := src[pos:]
+		switch {
+		case strings.HasPrefix(rest, "params."):
+			if !allowParams || !hasSimpleRequestSubfield(rest, "params") {
+				return false
+			}
+		case strings.HasPrefix(rest, "query."):
+			if !hasSimpleRequestSubfield(rest, "query") {
+				return false
+			}
+		case strings.HasPrefix(rest, "headers."):
+			if !hasSimpleRequestSubfield(rest, "headers") {
+				return false
+			}
+		case strings.HasPrefix(rest, "cookies."):
+			if !hasSimpleRequestSubfield(rest, "cookies") {
+				return false
+			}
+		case hasExactRequestScalar(rest, "method"):
+		case hasExactRequestScalar(rest, "path"):
+		default:
+			return false
+		}
+		offset = pos
+	}
+	return true
+}
+
+func hasSimpleRequestSubfield(rest string, group string) bool {
+	pos := len(group) + 1
+	if len(rest) <= pos || !isIdentStartRune(rune(rest[pos])) {
+		return false
+	}
+	pos++
+	for pos < len(rest) && isIdentPartRune(rune(rest[pos])) {
+		pos++
+	}
+	return true
+}
+
+func hasExactRequestScalar(rest string, name string) bool {
+	if !strings.HasPrefix(rest, name) {
+		return false
+	}
+	return len(rest) == len(name) || !isIdentPartRune(rune(rest[len(name)]))
 }
 
 func rewriteRawHandlerLines(lines []string) ([]string, bool) {
@@ -1270,6 +1333,7 @@ func compileGopressBodyWithOptions(ctx *gopressEmitContext, path string, body st
 		returnObject: options.returnObject,
 		directParams: options.directParams,
 		rawParams:    options.rawParams,
+		rawRequest:   options.rawRequest,
 		rawResponse:  options.rawResponse,
 	}
 	for _, param := range params {
@@ -2154,14 +2218,14 @@ func (c *gopressBodyContext) replaceBuilderRefs(expr string) string {
 }
 
 func compileRequestMember(expr string) string {
-	return replaceRequestMembers(expr, false, false)
+	return replaceRequestMembers(expr, false, false, false)
 }
 
 func (c *gopressBodyContext) replaceRequestMembers(expr string) string {
-	return replaceRequestMembers(expr, c.directParams, c.rawParams)
+	return replaceRequestMembers(expr, c.directParams, c.rawParams, c.rawRequest)
 }
 
-func replaceRequestMembers(expr string, directParams bool, rawParams bool) string {
+func replaceRequestMembers(expr string, directParams bool, rawParams bool, rawRequest bool) string {
 	expr = gopressRequestMemberRE.ReplaceAllStringFunc(expr, func(match string) string {
 		parts := strings.Split(match, ".")
 		key := parts[2]
@@ -2175,19 +2239,33 @@ func replaceRequestMembers(expr string, directParams bool, rawParams bool) strin
 			}
 			return fmt.Sprintf("req.Params[%q]", key)
 		case "query":
+			if rawRequest {
+				return fmt.Sprintf("gopress.QueryValue(request, %q)", key)
+			}
 			return fmt.Sprintf("req.Query[%q]", key)
 		case "body":
 			return fmt.Sprintf("req.Body[%q]", key)
 		case "headers":
+			if rawRequest {
+				return fmt.Sprintf("gopress.HeaderValue(request, %q)", strings.ToLower(key))
+			}
 			return fmt.Sprintf("req.Headers[%q]", strings.ToLower(key))
 		case "cookies":
+			if rawRequest {
+				return fmt.Sprintf("gopress.CookieValue(request, %q)", key)
+			}
 			return fmt.Sprintf("req.Cookies[%q]", key)
 		default:
 			return match
 		}
 	})
-	expr = strings.ReplaceAll(expr, "req.method", "req.Method")
-	expr = strings.ReplaceAll(expr, "req.path", "req.Path")
+	if rawRequest {
+		expr = strings.ReplaceAll(expr, "req.method", "request.Method")
+		expr = strings.ReplaceAll(expr, "req.path", "request.URL.Path")
+	} else {
+		expr = strings.ReplaceAll(expr, "req.method", "req.Method")
+		expr = strings.ReplaceAll(expr, "req.path", "req.Path")
+	}
 	return expr
 }
 
