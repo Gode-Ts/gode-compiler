@@ -873,7 +873,7 @@ func (a *gopressApp) emitGopressCall(ctx *gopressEmitContext, call gopressCall) 
 				if raw, paramName, ok := a.compileInlineRawSingleParamHandler(ctx, call.Args[1]); ok {
 					return []string{fmt.Sprintf("%s.HandleRawParam(%q, %s, %q, %s)", call.Receiver, strings.ToUpper(method), call.Args[0], paramName, raw)}
 				}
-				if raw, firstParam, secondParam, ok := a.compileInlineRawTwoParamHandler(ctx, call.Args[1]); ok {
+				if raw, firstParam, secondParam, ok := a.compileInlineRawTwoParamHandler(ctx, call.Args[0], call.Args[1]); ok {
 					return []string{fmt.Sprintf("%s.HandleRawParams2(%q, %s, %q, %q, %s)", call.Receiver, strings.ToUpper(method), call.Args[0], firstParam, secondParam, raw)}
 				}
 				if raw, ok := a.compileInlineRawParamHandler(ctx, call.Args[1]); ok {
@@ -902,7 +902,7 @@ func (a *gopressApp) emitGopressCall(ctx *gopressEmitContext, call gopressCall) 
 				if raw, paramName, ok := a.compileInlineRawSingleParamHandler(ctx, call.Args[1]); ok {
 					return []string{fmt.Sprintf("%s.HandleRawParam(%q, %s, %q, %s)", call.Receiver, strings.ToUpper(routeMethod), call.Args[0], paramName, raw)}
 				}
-				if raw, firstParam, secondParam, ok := a.compileInlineRawTwoParamHandler(ctx, call.Args[1]); ok {
+				if raw, firstParam, secondParam, ok := a.compileInlineRawTwoParamHandler(ctx, call.Args[0], call.Args[1]); ok {
 					return []string{fmt.Sprintf("%s.HandleRawParams2(%q, %s, %q, %q, %s)", call.Receiver, strings.ToUpper(routeMethod), call.Args[0], firstParam, secondParam, raw)}
 				}
 				if raw, ok := a.compileInlineRawParamHandler(ctx, call.Args[1]); ok {
@@ -1114,11 +1114,11 @@ func rawSingleParamName(src string) (string, bool) {
 	return name, true
 }
 
-func rawTwoParamNames(src string) (string, string, bool) {
+func rawTwoParamNames(src string, pathExpr string) (string, string, bool) {
 	if !canCompileRawParamHandler(src) {
 		return "", "", false
 	}
-	var names [2]string
+	var used [2]string
 	count := 0
 	for _, match := range gopressRequestMemberRE.FindAllStringSubmatch(src, -1) {
 		if len(match) < 3 || match[1] != "params" {
@@ -1127,7 +1127,7 @@ func rawTwoParamNames(src string) (string, string, bool) {
 		name := match[2]
 		seen := false
 		for idx := 0; idx < count; idx++ {
-			if names[idx] == name {
+			if used[idx] == name {
 				seen = true
 				break
 			}
@@ -1135,11 +1135,51 @@ func rawTwoParamNames(src string) (string, string, bool) {
 		if seen {
 			continue
 		}
-		if count == len(names) {
+		if count == len(used) {
+			return "", "", false
+		}
+		used[count] = name
+		count++
+	}
+	if count != 2 {
+		return "", "", false
+	}
+	if first, second, ok := rawRouteTwoParamNames(pathExpr); ok && rawParamNamesMatch(used, first, second) {
+		return first, second, true
+	}
+	return used[0], used[1], true
+}
+
+func rawParamNamesMatch(used [2]string, first string, second string) bool {
+	return (used[0] == first && used[1] == second) || (used[0] == second && used[1] == first)
+}
+
+func rawRouteTwoParamNames(pathExpr string) (string, string, bool) {
+	path, err := strconv.Unquote(strings.TrimSpace(pathExpr))
+	if err != nil {
+		return "", "", false
+	}
+	var names [2]string
+	count := 0
+	for idx := 0; idx < len(path); idx++ {
+		if path[idx] != ':' {
+			continue
+		}
+		start := idx + 1
+		end := start
+		for end < len(path) && path[end] != '/' {
+			end++
+		}
+		if start == end || count == len(names) {
+			return "", "", false
+		}
+		name := path[start:end]
+		if !isIdentifier(name) {
 			return "", "", false
 		}
 		names[count] = name
 		count++
+		idx = end - 1
 	}
 	if count != 2 {
 		return "", "", false
@@ -1147,8 +1187,8 @@ func rawTwoParamNames(src string) (string, string, bool) {
 	return names[0], names[1], true
 }
 
-func (a *gopressApp) compileInlineRawTwoParamHandler(ctx *gopressEmitContext, src string) (string, string, string, bool) {
-	firstParam, secondParam, ok := rawTwoParamNames(src)
+func (a *gopressApp) compileInlineRawTwoParamHandler(ctx *gopressEmitContext, pathExpr string, src string) (string, string, string, bool) {
+	firstParam, secondParam, ok := rawTwoParamNames(src, pathExpr)
 	if !ok {
 		return "", "", "", false
 	}
