@@ -65,9 +65,28 @@ type gopressRenderedFunc struct {
 }
 
 type gopressBodyContext struct {
-	emit     *gopressEmitContext
-	path     string
-	builders map[string]bool
+	emit         *gopressEmitContext
+	path         string
+	builders     map[string]bool
+	byteBuffers  map[string]int
+	locals       map[string]gopressLocal
+	directParams bool
+}
+
+type gopressLocal struct {
+	kind string
+}
+
+type gopressBodyOptions struct {
+	directParams bool
+}
+
+type gopressFastRequestUse struct {
+	query   bool
+	headers bool
+	cookies bool
+	body    bool
+	locals  bool
 }
 
 type gopressRouteMetadata struct {
@@ -87,6 +106,16 @@ type gopressMountMetadataRow struct {
 	Path     string `json:"path"`
 	Target   string `json:"target"`
 }
+
+var (
+	gopressAppVarRE        = regexp.MustCompile(`const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(gopress|Router)\s*\(\s*\)`)
+	gopressHandlerRE       = regexp.MustCompile(`export\s+(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*:\s*Promise<[^>]+>\s*\{`)
+	gopressHelperRE        = regexp.MustCompile(`(?:^|[;\n])\s*(?:export\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*(?::\s*([A-Za-z_][A-Za-z0-9_<>\[\]\s|]*))?\s*\{`)
+	gopressFunctionSpanRE  = regexp.MustCompile(`(?:^|[;\n])\s*(?:export\s+)?(?:async\s+)?function\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)\s*(?::\s*[A-Za-z_][A-Za-z0-9_<>\[\]\s|]*)?\s*\{`)
+	gopressReturnObjectRE  = regexp.MustCompile(`\breturn\s*\{`)
+	gopressBuilderVarRE    = regexp.MustCompile(`(?:^|[\s;{}])(?:let|var)\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s*:\s*string)?\s*=\s*(['"])`)
+	gopressRequestMemberRE = regexp.MustCompile(`req\.(params|query|body|headers|cookies)\.([A-Za-z_][A-Za-z0-9_]*)`)
+)
 
 func isGopressSource(src []byte, cfg config.Config) bool {
 	return cfg.Framework == "gopress" || strings.Contains(string(src), `from "gopress"`) || strings.Contains(string(src), `from 'gopress'`)
@@ -110,7 +139,7 @@ func parseGopress(path string, src string, cfg config.Config) *gopressApp {
 	if !strings.Contains(src, "gopress") {
 		app.diags = append(app.diags, diagnostics.Errorf(path, diagnostics.Position{Line: 1, Column: 1}, "GODE_BIND_002", "gopress app must import from \"gopress\""))
 	}
-	for _, match := range regexp.MustCompile(`const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(gopress|Router)\s*\(\s*\)`).FindAllStringSubmatch(src, -1) {
+	for _, match := range gopressAppVarRE.FindAllStringSubmatch(src, -1) {
 		kind := "app"
 		if match[2] == "Router" {
 			kind = "router"
@@ -141,8 +170,7 @@ func parseGopress(path string, src string, cfg config.Config) *gopressApp {
 
 func parseGopressHandlers(src string) []gopressHandler {
 	var handlers []gopressHandler
-	re := regexp.MustCompile(`export\s+(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*:\s*Promise<[^>]+>\s*\{`)
-	for _, loc := range re.FindAllStringSubmatchIndex(src, -1) {
+	for _, loc := range gopressHandlerRE.FindAllStringSubmatchIndex(src, -1) {
 		name := src[loc[2]:loc[3]]
 		params := src[loc[4]:loc[5]]
 		open := loc[1] - 1
@@ -161,8 +189,7 @@ func parseGopressHelperFunctions(src string, handlers []gopressHandler) []gopres
 		handlerNames[handler.Name] = true
 	}
 	var functions []gopressFunction
-	re := regexp.MustCompile(`(?:^|[;\n])\s*(?:export\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*(?::\s*([A-Za-z_][A-Za-z0-9_<>\[\]\s|]*))?\s*\{`)
-	for _, loc := range re.FindAllStringSubmatchIndex(src, -1) {
+	for _, loc := range gopressHelperRE.FindAllStringSubmatchIndex(src, -1) {
 		name := src[loc[2]:loc[3]]
 		if handlerNames[name] {
 			continue
@@ -178,9 +205,10 @@ func parseGopressHelperFunctions(src string, handlers []gopressHandler) []gopres
 			continue
 		}
 		body := src[open+1 : close]
+		parsedParams := optimizeGopressParams(parseGopressParams(params), body)
 		functions = append(functions, gopressFunction{
 			Name:       name,
-			Params:     parseGopressParams(params),
+			Params:     parsedParams,
 			Body:       body,
 			ReturnType: inferGopressReturnType(declaredReturn, body),
 		})
@@ -218,6 +246,25 @@ func compileGopressType(tsType string) string {
 	}
 }
 
+func optimizeGopressParams(params []gopressParam, body string) []gopressParam {
+	for i := range params {
+		if params[i].GoType == "float64" && isIntegerOnlyParamUse(body, params[i].Name) {
+			params[i].GoType = "int"
+		}
+	}
+	return params
+}
+
+func isIntegerOnlyParamUse(body string, name string) bool {
+	if !paramAppearsInForCondition(body, name) {
+		return false
+	}
+	if paramHasFloatyUse(body, name) {
+		return false
+	}
+	return true
+}
+
 func inferGopressReturnType(declared string, body string) string {
 	declared = strings.TrimSpace(declared)
 	switch declared {
@@ -230,7 +277,7 @@ func inferGopressReturnType(declared string, body string) string {
 	case "number":
 		return "float64"
 	}
-	if regexp.MustCompile(`\breturn\s*\{`).MatchString(body) {
+	if gopressReturnObjectRE.MatchString(body) {
 		return "map[string]any"
 	}
 	if strings.Contains(body, "return ") {
@@ -241,8 +288,7 @@ func inferGopressReturnType(declared string, body string) string {
 
 func findFunctionSpans(src string) [][2]int {
 	var spans [][2]int
-	re := regexp.MustCompile(`(?:^|[;\n])\s*(?:export\s+)?(?:async\s+)?function\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)\s*(?::\s*[A-Za-z_][A-Za-z0-9_<>\[\]\s|]*)?\s*\{`)
-	for _, loc := range re.FindAllStringIndex(src, -1) {
+	for _, loc := range gopressFunctionSpanRE.FindAllStringIndex(src, -1) {
 		open := loc[1] - 1
 		close := findMatching(src, open, '{', '}')
 		if close >= 0 {
@@ -324,7 +370,7 @@ func (a *gopressApp) emit() (string, diagnostics.List) {
 		if helper.ReturnType != "" {
 			returnType = " " + helper.ReturnType
 		}
-		lines, bodyDiags := compileGopressBody(ctx, a.path, helper.Body)
+		lines, bodyDiags := compileGopressBody(ctx, a.path, helper.Body, helper.Params)
 		a.diags = append(a.diags, bodyDiags...)
 		helperBlocks = append(helperBlocks, gopressRenderedFunc{
 			Header:     fmt.Sprintf("func %s(%s)%s {", helper.Name, strings.Join(params, ", "), returnType),
@@ -340,7 +386,7 @@ func (a *gopressApp) emit() (string, diagnostics.List) {
 		} else {
 			header = fmt.Sprintf("func %s(req *gopress.Request, res *gopress.Response, next gopress.NextFunc) error {", handler.GoName)
 		}
-		lines, bodyDiags := compileGopressBody(ctx, a.path, handler.Body)
+		lines, bodyDiags := compileGopressBody(ctx, a.path, handler.Body, nil)
 		a.diags = append(a.diags, bodyDiags...)
 		handlerBlocks = append(handlerBlocks, gopressRenderedFunc{Header: header, Lines: lines})
 	}
@@ -507,6 +553,11 @@ func (a *gopressApp) emitGopressCall(ctx *gopressEmitContext, call gopressCall) 
 		if len(call.Args) < 2 {
 			return nil
 		}
+		if len(call.Args) == 2 {
+			if usage, ok := a.fastHandlerUsage(call.Args[1]); ok {
+				return []string{fmt.Sprintf("%s.HandleFastOptions(%q, %s, %s, %s)", call.Receiver, strings.ToUpper(method), call.Args[0], usage.compileOptions(), a.compileInlineFastHandler(ctx, call.Args[1]))}
+			}
+		}
 		args := []string{call.Args[0]}
 		for _, arg := range call.Args[1:] {
 			args = append(args, a.compileHandlerArg(ctx, arg))
@@ -602,9 +653,63 @@ func (a *gopressApp) compileInlineHandler(ctx *gopressEmitContext, src string) s
 	if bodyStart < 0 || bodyEnd < bodyStart {
 		return "func(req *gopress.Request, res *gopress.Response, next gopress.NextFunc) error { return nil }"
 	}
-	lines, bodyDiags := compileGopressBody(ctx, a.path, src[bodyStart+1:bodyEnd])
+	lines, bodyDiags := compileGopressBody(ctx, a.path, src[bodyStart+1:bodyEnd], nil)
 	a.diags = append(a.diags, bodyDiags...)
-	return fmt.Sprintf("func(req *gopress.Request, res *gopress.Response, next gopress.NextFunc) error {\n%s\nreturn nil\n}", strings.Join(lines, "\n"))
+	return formatGopressFunc("func(req *gopress.Request, res *gopress.Response, next gopress.NextFunc) error", lines)
+}
+
+func (a *gopressApp) canCompileFastHandler(src string) bool {
+	_, ok := a.fastHandlerUsage(src)
+	return ok
+}
+
+func (a *gopressApp) fastHandlerUsage(src string) (gopressFastRequestUse, bool) {
+	trimmed := strings.TrimSpace(src)
+	if !strings.Contains(trimmed, "=>") || strings.Contains(trimmed, "next") || isErrorArrow(trimmed) {
+		return gopressFastRequestUse{}, false
+	}
+	usage := gopressFastRequestUse{
+		query:   strings.Contains(trimmed, "req.query"),
+		headers: strings.Contains(trimmed, "req.headers"),
+		cookies: strings.Contains(trimmed, "req.cookies"),
+		body:    strings.Contains(trimmed, "req.body"),
+		locals:  strings.Contains(trimmed, "req.locals"),
+	}
+	return usage, true
+}
+
+func (u gopressFastRequestUse) compileOptions() string {
+	var fields []string
+	if u.query {
+		fields = append(fields, "Query: true")
+	}
+	if u.headers {
+		fields = append(fields, "Headers: true")
+	}
+	if u.cookies {
+		fields = append(fields, "Cookies: true")
+	}
+	if u.body {
+		fields = append(fields, "Body: true")
+	}
+	if u.locals {
+		fields = append(fields, "Locals: true")
+	}
+	if len(fields) == 0 {
+		return "gopress.FastRequestOptions{}"
+	}
+	return "gopress.FastRequestOptions{" + strings.Join(fields, ", ") + "}"
+}
+
+func (a *gopressApp) compileInlineFastHandler(ctx *gopressEmitContext, src string) string {
+	bodyStart := strings.Index(src, "{")
+	bodyEnd := strings.LastIndex(src, "}")
+	if bodyStart < 0 || bodyEnd < bodyStart {
+		return "func(req *gopress.Request, res *gopress.Response) error { return nil }"
+	}
+	lines, bodyDiags := compileGopressBodyWithOptions(ctx, a.path, src[bodyStart+1:bodyEnd], nil, gopressBodyOptions{directParams: true})
+	a.diags = append(a.diags, bodyDiags...)
+	return formatGopressFunc("func(req *gopress.Request, res *gopress.Response) error", lines)
 }
 
 func (a *gopressApp) compileInlineErrorHandler(ctx *gopressEmitContext, src string) string {
@@ -613,17 +718,50 @@ func (a *gopressApp) compileInlineErrorHandler(ctx *gopressEmitContext, src stri
 	if bodyStart < 0 || bodyEnd < bodyStart {
 		return "func(err error, req *gopress.Request, res *gopress.Response, next gopress.NextFunc) error { return nil }"
 	}
-	lines, bodyDiags := compileGopressBody(ctx, a.path, src[bodyStart+1:bodyEnd])
+	lines, bodyDiags := compileGopressBody(ctx, a.path, src[bodyStart+1:bodyEnd], nil)
 	a.diags = append(a.diags, bodyDiags...)
-	return fmt.Sprintf("func(err error, req *gopress.Request, res *gopress.Response, next gopress.NextFunc) error {\n%s\nreturn nil\n}", strings.Join(lines, "\n"))
+	return formatGopressFunc("func(err error, req *gopress.Request, res *gopress.Response, next gopress.NextFunc) error", lines)
 }
 
-func compileGopressBody(ctx *gopressEmitContext, path string, body string) ([]string, diagnostics.List) {
+func formatGopressFunc(header string, lines []string) string {
+	body := strings.Join(lines, "\n")
+	if !gopressLinesReturn(lines) {
+		if body != "" {
+			body += "\n"
+		}
+		body += "return nil"
+	}
+	return fmt.Sprintf("%s {\n%s\n}", header, body)
+}
+
+func gopressLinesReturn(lines []string) bool {
+	for idx := len(lines) - 1; idx >= 0; idx-- {
+		line := strings.TrimSpace(lines[idx])
+		if line == "" || line == "}" {
+			continue
+		}
+		return strings.HasPrefix(line, "return ")
+	}
+	return false
+}
+
+func compileGopressBody(ctx *gopressEmitContext, path string, body string, params []gopressParam) ([]string, diagnostics.List) {
+	return compileGopressBodyWithOptions(ctx, path, body, params, gopressBodyOptions{})
+}
+
+func compileGopressBodyWithOptions(ctx *gopressEmitContext, path string, body string, params []gopressParam, options gopressBodyOptions) ([]string, diagnostics.List) {
 	builders := discoverStringBuilderVars(body)
+	byteBuffers := discoverJSONByteBufferVars(body, builders)
+	for name := range byteBuffers {
+		delete(builders, name)
+	}
 	if len(builders) > 0 {
 		ctx.addImport("strings")
 	}
-	bodyCtx := &gopressBodyContext{emit: ctx, path: path, builders: builders}
+	bodyCtx := &gopressBodyContext{emit: ctx, path: path, builders: builders, byteBuffers: byteBuffers, locals: map[string]gopressLocal{}, directParams: options.directParams}
+	for _, param := range params {
+		bodyCtx.locals[param.Name] = gopressLocal{kind: param.GoType}
+	}
 	return bodyCtx.compile(body)
 }
 
@@ -762,7 +900,7 @@ func (c *gopressBodyContext) compileStatement(stmt string) ([]string, diagnostic
 	if lines, ok := c.compileAssignment(stmt); ok {
 		return lines, nil
 	}
-	if regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*\s*\(`).MatchString(stmt) {
+	if isSimpleCallStatement(stmt) {
 		return []string{c.compileExpr(stmt)}, nil
 	}
 	return nil, diagnostics.List{unsupportedGopressStatement(c.path, stmt)}
@@ -811,23 +949,48 @@ func (c *gopressBodyContext) compileVarDecl(stmt string, forClause bool) ([]stri
 	}
 	expr = strings.TrimSpace(expr)
 	if c.builders[name] && !forClause {
+		c.locals[name] = gopressLocal{kind: "builder"}
 		lines := []string{fmt.Sprintf("var %s strings.Builder", name)}
 		lines = append(lines, c.compileBuilderAppend(name, expr)...)
 		return lines, true
 	}
-	compiled := c.compileExpr(expr)
-	if (keyword == "let" || keyword == "var" || forClause) && isIntegerLiteral(expr) {
-		compiled = expr + ".0"
+	if capacity, ok := c.byteBuffers[name]; ok && !forClause {
+		c.locals[name] = gopressLocal{kind: "bytes"}
+		lines := []string{fmt.Sprintf("%s := make([]byte, 0, %d)", name, capacity)}
+		lines = append(lines, c.compileByteAppend(name, expr)...)
+		return lines, true
 	}
+	compiled := c.compileExpr(expr)
+	c.locals[name] = gopressLocal{kind: c.inferLocalKind(expr)}
 	if keyword == "const" && !forClause && isGopressConstLiteral(expr) {
 		return []string{fmt.Sprintf("const %s = %s", name, compiled)}, true
 	}
 	return []string{fmt.Sprintf("%s := %s", name, compiled)}, true
 }
 
+func (c *gopressBodyContext) inferLocalKind(expr string) string {
+	expr = strings.TrimSpace(expr)
+	switch {
+	case isStringLiteral(expr):
+		return "string"
+	case isIntegerLiteral(expr):
+		return "int"
+	case isNumberLiteral(expr):
+		return "float64"
+	case expr == "true" || expr == "false":
+		return "bool"
+	case expr == "performance.now()":
+		return "time"
+	case strings.HasPrefix(expr, "performance.now() -"):
+		return "float64"
+	default:
+		return ""
+	}
+}
+
 func (c *gopressBodyContext) compileAssignment(stmt string) ([]string, bool) {
 	stmt = strings.TrimSpace(stmt)
-	if regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\+\+|--)$`).MatchString(stmt) {
+	if isPostIncDec(stmt) {
 		return []string{stmt}, true
 	}
 	for _, op := range []string{"+=", "-=", "*=", "/=", "="} {
@@ -840,11 +1003,14 @@ func (c *gopressBodyContext) compileAssignment(stmt string) ([]string, bool) {
 		}
 		left := strings.TrimSpace(stmt[:idx])
 		right := strings.TrimSpace(stmt[idx+len(op):])
-		if !regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]+\])?$`).MatchString(left) || right == "" {
+		if !isAssignableTarget(left) || right == "" {
 			return nil, false
 		}
 		if c.builders[left] && op == "+=" {
 			return c.compileBuilderAppend(left, right), true
+		}
+		if _, ok := c.byteBuffers[left]; ok && op == "+=" {
+			return c.compileByteAppend(left, right), true
 		}
 		return []string{fmt.Sprintf("%s %s %s", left, op, c.compileExpr(right))}, true
 	}
@@ -880,8 +1046,24 @@ func (c *gopressBodyContext) compileStringPart(expr string) string {
 	if c.builders[expr] {
 		return expr + ".String()"
 	}
+	if local, ok := c.locals[expr]; ok {
+		switch local.kind {
+		case "string":
+			return expr
+		case "int":
+			c.emit.addImport("strconv")
+			return "strconv.Itoa(" + c.compileExpr(expr) + ")"
+		case "bool":
+			c.emit.addImport("strconv")
+			return "strconv.FormatBool(" + c.compileExpr(expr) + ")"
+		}
+	}
 	if strings.HasPrefix(expr, "req.") {
 		return c.compileExpr(expr)
+	}
+	if isIntegerLiteral(expr) {
+		c.emit.addImport("strconv")
+		return "strconv.Itoa(" + expr + ")"
 	}
 	if expr == "true" || expr == "false" {
 		c.emit.addImport("strconv")
@@ -889,6 +1071,64 @@ func (c *gopressBodyContext) compileStringPart(expr string) string {
 	}
 	c.emit.addImport("strconv")
 	return "strconv.FormatFloat(" + c.compileExpr(expr) + ", 'f', -1, 64)"
+}
+
+func (c *gopressBodyContext) compileByteAppend(name string, expr string) []string {
+	parts := splitTopLevelPlus(expr)
+	lines := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		lines = append(lines, c.compileByteAppendPart(name, part))
+	}
+	return lines
+}
+
+func (c *gopressBodyContext) compileByteAppendPart(name string, expr string) string {
+	expr = strings.TrimSpace(expr)
+	if isStringLiteral(expr) {
+		return fmt.Sprintf("%s = append(%s, %s...)", name, name, expr)
+	}
+	if c.builders[expr] {
+		return fmt.Sprintf("%s = append(%s, %s.String()...)", name, name, expr)
+	}
+	if _, ok := c.byteBuffers[expr]; ok {
+		return fmt.Sprintf("%s = append(%s, %s...)", name, name, expr)
+	}
+	if local, ok := c.locals[expr]; ok {
+		switch local.kind {
+		case "string":
+			return fmt.Sprintf("%s = append(%s, %s...)", name, name, expr)
+		case "int":
+			c.emit.addImport("strconv")
+			return fmt.Sprintf("%s = strconv.AppendInt(%s, int64(%s), 10)", name, name, c.compileExpr(expr))
+		case "float64":
+			c.emit.addImport("strconv")
+			return fmt.Sprintf("%s = strconv.AppendFloat(%s, %s, 'f', -1, 64)", name, name, c.compileExpr(expr))
+		case "bool":
+			c.emit.addImport("strconv")
+			return fmt.Sprintf("%s = strconv.AppendBool(%s, %s)", name, name, c.compileExpr(expr))
+		}
+	}
+	if strings.HasPrefix(expr, "req.") {
+		return fmt.Sprintf("%s = append(%s, %s...)", name, name, c.compileExpr(expr))
+	}
+	if isIntegerLiteral(expr) {
+		c.emit.addImport("strconv")
+		return fmt.Sprintf("%s = strconv.AppendInt(%s, %s, 10)", name, name, expr)
+	}
+	if isNumberLiteral(expr) {
+		c.emit.addImport("strconv")
+		return fmt.Sprintf("%s = strconv.AppendFloat(%s, %s, 'f', -1, 64)", name, name, expr)
+	}
+	if expr == "true" || expr == "false" {
+		c.emit.addImport("strconv")
+		return fmt.Sprintf("%s = strconv.AppendBool(%s, %s)", name, name, expr)
+	}
+	c.emit.addImport("strconv")
+	return fmt.Sprintf("%s = strconv.AppendFloat(%s, %s, 'f', -1, 64)", name, name, c.compileExpr(expr))
 }
 
 func (c *gopressBodyContext) compileExpr(expr string) string {
@@ -899,9 +1139,9 @@ func (c *gopressBodyContext) compileExpr(expr string) string {
 		c.emit.addImport("time")
 		return "time.Now()"
 	}
-	if match := regexp.MustCompile(`^performance\.now\(\)\s*-\s*([A-Za-z_][A-Za-z0-9_]*)$`).FindStringSubmatch(expr); len(match) == 2 {
+	if start, ok := parsePerformanceNowDelta(expr); ok {
 		c.emit.addImport("time")
-		return fmt.Sprintf("float64(time.Since(%s).Microseconds()) / 1000.0", match[1])
+		return fmt.Sprintf("float64(time.Since(%s).Microseconds()) / 1000.0", start)
 	}
 	if strings.HasPrefix(expr, "next(") {
 		return expr
@@ -913,12 +1153,15 @@ func (c *gopressBodyContext) compileExpr(expr string) string {
 		return c.compileObjectLiteral(expr)
 	}
 	if strings.HasPrefix(expr, "req.") {
-		return compileRequestMember(expr)
+		return c.replaceRequestMembers(expr)
 	}
-	return c.replaceBuilderRefs(replaceRequestMembers(expr))
+	return c.replaceBuilderRefs(c.replaceRequestMembers(expr))
 }
 
 func (c *gopressBodyContext) compileResponseChain(expr string) string {
+	if fast, ok := c.compileFastResponseChain(expr); ok {
+		return fast
+	}
 	replacements := map[string]string{
 		".status(":     ".Status(",
 		".send(":       ".Send(",
@@ -934,10 +1177,149 @@ func (c *gopressBodyContext) compileResponseChain(expr string) string {
 	for from, to := range replacements {
 		out = strings.ReplaceAll(out, from, to)
 	}
-	out = replaceRequestMembers(out)
+	out = c.replaceRequestMembers(out)
 	out = c.replaceObjectArgs(out)
 	out = c.replaceBuilderRefs(out)
 	return out
+}
+
+func (c *gopressBodyContext) compileFastResponseChain(expr string) (string, bool) {
+	expr = strings.TrimSpace(expr)
+	if name, ok := parseJSONTypeSend(expr); ok {
+		if _, ok := c.byteBuffers[name]; ok {
+			return "res.JSONBytes(" + name + ")", true
+		}
+		if c.builders[name] {
+			return "res.JSONString(" + name + ".String())", true
+		}
+		if local, ok := c.locals[name]; ok && local.kind == "string" {
+			return "res.JSONString(" + name + ")", true
+		}
+	}
+	if strings.HasPrefix(expr, "res.status(") {
+		openStatus := strings.IndexByte(expr, '(')
+		closeStatus := findMatching(expr, openStatus, '(', ')')
+		if closeStatus > openStatus && strings.HasPrefix(strings.TrimSpace(expr[closeStatus+1:]), ".json(") {
+			status := strings.TrimSpace(expr[openStatus+1 : closeStatus])
+			jsonOpen := closeStatus + strings.Index(expr[closeStatus+1:], "(") + 1
+			jsonClose := findMatching(expr, jsonOpen, '(', ')')
+			if jsonClose > jsonOpen {
+				if raw, ok := c.compileJSONLiteral(expr[jsonOpen+1 : jsonClose]); ok {
+					return fmt.Sprintf("res.StatusJSON(%s, %s)", status, raw), true
+				}
+			}
+		}
+	}
+	if strings.HasPrefix(expr, "res.json(") {
+		open := strings.IndexByte(expr, '(')
+		close := findMatching(expr, open, '(', ')')
+		if close > open {
+			if raw, ok := c.compileJSONLiteral(expr[open+1 : close]); ok {
+				return "res.JSONString(" + raw + ")", true
+			}
+		}
+	}
+	return "", false
+}
+
+func (c *gopressBodyContext) compileJSONLiteral(expr string) (string, bool) {
+	expr = strings.TrimSpace(expr)
+	if !strings.HasPrefix(expr, "{") {
+		return "", false
+	}
+	body := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(expr, "{"), "}"))
+	if strings.Contains(body, "...") {
+		return "", false
+	}
+	if body == "" {
+		return strconv.Quote("{}"), true
+	}
+	parts := splitTopLevelArgs(body)
+	var fragments []string
+	literal := "{"
+	flushLiteral := func() {
+		if literal == "" {
+			return
+		}
+		fragments = append(fragments, strconv.Quote(literal))
+		literal = ""
+	}
+	for idx, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" || strings.HasPrefix(part, "...") {
+			return "", false
+		}
+		key := ""
+		value := ""
+		if colon := findTopLevelColon(part); colon >= 0 {
+			key = strings.Trim(strings.TrimSpace(part[:colon]), `"'`)
+			value = strings.TrimSpace(part[colon+1:])
+		} else {
+			key = strings.Trim(strings.TrimSpace(part), `"'`)
+			value = part
+		}
+		if key == "" || value == "" {
+			return "", false
+		}
+		if idx > 0 {
+			literal += ","
+		}
+		keyJSON, err := json.Marshal(key)
+		if err != nil {
+			return "", false
+		}
+		literal += string(keyJSON) + ":"
+		valueExpr, ok := c.compileJSONValue(value)
+		if !ok {
+			return "", false
+		}
+		flushLiteral()
+		fragments = append(fragments, valueExpr)
+	}
+	literal += "}"
+	flushLiteral()
+	return strings.Join(fragments, " + "), true
+}
+
+func (c *gopressBodyContext) compileJSONValue(expr string) (string, bool) {
+	expr = strings.TrimSpace(expr)
+	switch {
+	case isStringLiteral(expr):
+		value, err := strconv.Unquote(expr)
+		if err != nil {
+			return "", false
+		}
+		data, err := json.Marshal(value)
+		if err != nil {
+			return "", false
+		}
+		return strconv.Quote(string(data)), true
+	case expr == "true" || expr == "false" || expr == "null":
+		return expr, true
+	case isIntegerLiteral(expr) || isNumberLiteral(expr):
+		return expr, true
+	case strings.HasPrefix(expr, "req."):
+		c.emit.addImport("strconv")
+		return "strconv.Quote(" + c.compileExpr(expr) + ")", true
+	}
+	compiled := c.compileExpr(expr)
+	if local, ok := c.locals[expr]; ok {
+		switch local.kind {
+		case "string":
+			c.emit.addImport("strconv")
+			return "strconv.Quote(" + compiled + ")", true
+		case "int":
+			c.emit.addImport("strconv")
+			return "strconv.Itoa(" + compiled + ")", true
+		case "float64":
+			c.emit.addImport("strconv")
+			return "strconv.FormatFloat(" + compiled + ", 'f', -1, 64)", true
+		case "bool":
+			c.emit.addImport("strconv")
+			return "strconv.FormatBool(" + compiled + ")", true
+		}
+	}
+	return "", false
 }
 
 func (c *gopressBodyContext) replaceObjectArgs(expr string) string {
@@ -1002,25 +1384,28 @@ func (c *gopressBodyContext) compileObjectLiteral(expr string) string {
 
 func (c *gopressBodyContext) replaceBuilderRefs(expr string) string {
 	for name := range c.builders {
-		re := regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\b`)
-		expr = re.ReplaceAllStringFunc(expr, func(match string) string {
-			return match + ".String()"
-		})
+		expr = replaceIdentifier(expr, name, name+".String()")
 	}
 	return expr
 }
 
 func compileRequestMember(expr string) string {
-	return replaceRequestMembers(expr)
+	return replaceRequestMembers(expr, false)
 }
 
-func replaceRequestMembers(expr string) string {
-	re := regexp.MustCompile(`req\.(params|query|body|headers|cookies)\.([A-Za-z_][A-Za-z0-9_]*)`)
-	expr = re.ReplaceAllStringFunc(expr, func(match string) string {
+func (c *gopressBodyContext) replaceRequestMembers(expr string) string {
+	return replaceRequestMembers(expr, c.directParams)
+}
+
+func replaceRequestMembers(expr string, directParams bool) string {
+	expr = gopressRequestMemberRE.ReplaceAllStringFunc(expr, func(match string) string {
 		parts := strings.Split(match, ".")
 		key := parts[2]
 		switch parts[1] {
 		case "params":
+			if directParams {
+				return fmt.Sprintf("req.Param(%q)", key)
+			}
 			return fmt.Sprintf("req.Params[%q]", key)
 		case "query":
 			return fmt.Sprintf("req.Query[%q]", key)
@@ -1041,15 +1426,167 @@ func replaceRequestMembers(expr string) string {
 
 func discoverStringBuilderVars(body string) map[string]bool {
 	out := map[string]bool{}
-	re := regexp.MustCompile(`(?:^|[\s;{}])(?:let|var)\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s*:\s*string)?\s*=\s*(['"])`)
-	for _, match := range re.FindAllStringSubmatch(body, -1) {
+	for _, match := range gopressBuilderVarRE.FindAllStringSubmatch(body, -1) {
 		name := match[1]
-		mutates := regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\s*\+=`).MatchString(body)
-		if mutates {
+		if hasAddAssign(body, name) {
 			out[name] = true
 		}
 	}
 	return out
+}
+
+func discoverJSONByteBufferVars(body string, builders map[string]bool) map[string]int {
+	out := map[string]int{}
+	for name := range builders {
+		if !isJSONSendVar(body, name) {
+			continue
+		}
+		capacity := estimateJSONByteBufferCapacity(body, name)
+		if capacity < 64 {
+			capacity = 64
+		}
+		out[name] = capacity
+	}
+	return out
+}
+
+func isJSONSendVar(body string, name string) bool {
+	compact := stripWhitespaceOutsideStrings(body)
+	for _, quote := range []string{`"`, `'`} {
+		if strings.Contains(compact, ".type("+quote+"application/json"+quote+").send("+name+")") {
+			return true
+		}
+	}
+	return false
+}
+
+func stripWhitespaceOutsideStrings(src string) string {
+	var out strings.Builder
+	out.Grow(len(src))
+	inString := rune(0)
+	escaped := false
+	for _, r := range src {
+		if inString != 0 {
+			out.WriteRune(r)
+			if escaped {
+				escaped = false
+				continue
+			}
+			if r == '\\' {
+				escaped = true
+				continue
+			}
+			if r == inString {
+				inString = 0
+			}
+			continue
+		}
+		if r == '"' || r == '\'' {
+			inString = r
+			out.WriteRune(r)
+			continue
+		}
+		if unicode.IsSpace(r) {
+			continue
+		}
+		out.WriteRune(r)
+	}
+	return out.String()
+}
+
+func estimateJSONByteBufferCapacity(body string, name string) int {
+	total := 0
+	for pos := 0; pos < len(body); {
+		pos = skipGopressSeparators(body, pos)
+		if pos >= len(body) {
+			break
+		}
+		if hasKeywordAt(body, pos, "for") {
+			loopEnd, capacity, ok := estimateLoopByteBufferCapacity(body, pos, name)
+			if ok {
+				total += capacity
+				pos = loopEnd
+				continue
+			}
+		}
+		stmt, next := readGopressStatement(body, pos)
+		total += estimateAppendExprCapacity(stmt, name)
+		pos = next
+	}
+	return total
+}
+
+func estimateLoopByteBufferCapacity(src string, pos int, name string) (int, int, bool) {
+	openHeader := skipSpace(src, pos+len("for"))
+	if openHeader >= len(src) || src[openHeader] != '(' {
+		return pos, 0, false
+	}
+	closeHeader := findMatching(src, openHeader, '(', ')')
+	if closeHeader < 0 {
+		return pos, 0, false
+	}
+	openBody := skipSpace(src, closeHeader+1)
+	if openBody >= len(src) || src[openBody] != '{' {
+		return pos, 0, false
+	}
+	closeBody := findMatching(src, openBody, '{', '}')
+	if closeBody < 0 {
+		return pos, 0, false
+	}
+	iterations := estimateForIterations(src[openHeader+1 : closeHeader])
+	if iterations <= 0 {
+		iterations = 1
+	}
+	bodyCapacity := estimateJSONByteBufferCapacity(src[openBody+1:closeBody], name)
+	return closeBody + 1, bodyCapacity * iterations, true
+}
+
+func estimateForIterations(header string) int {
+	parts := splitTopLevelSemicolons(header)
+	if len(parts) != 3 {
+		return 0
+	}
+	condition := strings.TrimSpace(parts[1])
+	for _, op := range []string{"<=", "<"} {
+		idx := strings.Index(condition, op)
+		if idx < 0 {
+			continue
+		}
+		boundText := strings.TrimSpace(condition[idx+len(op):])
+		bound, err := strconv.Atoi(boundText)
+		if err != nil {
+			return 0
+		}
+		if op == "<=" {
+			return bound + 1
+		}
+		return bound
+	}
+	return 0
+}
+
+func estimateAppendExprCapacity(stmt string, name string) int {
+	stmt = strings.TrimSpace(strings.TrimSuffix(stmt, ";"))
+	prefix := name + " +="
+	if !strings.HasPrefix(stmt, prefix) {
+		return 0
+	}
+	expr := strings.TrimSpace(strings.TrimPrefix(stmt, prefix))
+	total := 0
+	for _, part := range splitTopLevelPlus(expr) {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if isStringLiteral(part) {
+			if value, err := strconv.Unquote(part); err == nil {
+				total += len(value)
+				continue
+			}
+		}
+		total += 24
+	}
+	return total
 }
 
 func zeroReturnStatement(goType string) string {
@@ -1107,11 +1644,19 @@ func readGopressStatement(src string, pos int) (string, int) {
 			depth--
 		case ';', '\n':
 			if depth == 0 {
+				if ch == '\n' && isGopressChainContinuation(src, i+1) {
+					continue
+				}
 				return src[pos:i], i + 1
 			}
 		}
 	}
 	return src[pos:], len(src)
+}
+
+func isGopressChainContinuation(src string, pos int) bool {
+	pos = skipSpace(src, pos)
+	return pos < len(src) && src[pos] == '.'
 }
 
 func readRestLine(src string, pos int) string {
@@ -1232,14 +1777,297 @@ func splitTopLevelPlus(src string) []string {
 func isGopressConstLiteral(expr string) bool {
 	expr = strings.TrimSpace(expr)
 	return isIntegerLiteral(expr) ||
-		regexp.MustCompile(`^-?[0-9]+\.[0-9]+$`).MatchString(expr) ||
+		isDecimalLiteral(expr) ||
 		isStringLiteral(expr) ||
 		expr == "true" ||
 		expr == "false"
 }
 
 func isIntegerLiteral(expr string) bool {
-	return regexp.MustCompile(`^-?[0-9]+$`).MatchString(strings.TrimSpace(expr))
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return false
+	}
+	if expr[0] == '-' {
+		expr = expr[1:]
+	}
+	if expr == "" {
+		return false
+	}
+	for _, r := range expr {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isNumberLiteral(expr string) bool {
+	expr = strings.TrimSpace(expr)
+	return isIntegerLiteral(expr) || isDecimalLiteral(expr)
+}
+
+func paramAppearsInForCondition(body string, name string) bool {
+	for pos := 0; pos < len(body); {
+		idx := strings.Index(body[pos:], "for")
+		if idx < 0 {
+			return false
+		}
+		idx += pos
+		if !hasKeywordAt(body, idx, "for") {
+			pos = idx + len("for")
+			continue
+		}
+		open := skipSpace(body, idx+len("for"))
+		if open >= len(body) || body[open] != '(' {
+			pos = idx + len("for")
+			continue
+		}
+		close := findMatching(body, open, '(', ')')
+		if close < 0 {
+			return false
+		}
+		parts := splitTopLevelSemicolons(body[open+1 : close])
+		if len(parts) == 3 && containsIdentifier(parts[1], name) {
+			return true
+		}
+		pos = close + 1
+	}
+	return false
+}
+
+func paramHasFloatyUse(body string, name string) bool {
+	if strings.Contains(body, "Math.") || containsDecimalLiteral(body) {
+		return true
+	}
+	for idx := 0; idx < len(body); idx++ {
+		if body[idx] != '/' {
+			continue
+		}
+		leftStart := idx - 1
+		for leftStart >= 0 && unicode.IsSpace(rune(body[leftStart])) {
+			leftStart--
+		}
+		leftEnd := leftStart + 1
+		for leftStart >= 0 && isIdentPartRune(rune(body[leftStart])) {
+			leftStart--
+		}
+		rightStart := idx + 1
+		for rightStart < len(body) && unicode.IsSpace(rune(body[rightStart])) {
+			rightStart++
+		}
+		rightEnd := rightStart
+		for rightEnd < len(body) && isIdentPartRune(rune(body[rightEnd])) {
+			rightEnd++
+		}
+		if body[leftStart+1:leftEnd] == name || body[rightStart:rightEnd] == name {
+			return true
+		}
+	}
+	return false
+}
+
+func containsDecimalLiteral(src string) bool {
+	for i := 0; i < len(src); i++ {
+		if src[i] != '.' || i == 0 || i+1 >= len(src) {
+			continue
+		}
+		if src[i-1] >= '0' && src[i-1] <= '9' && src[i+1] >= '0' && src[i+1] <= '9' {
+			return true
+		}
+	}
+	return false
+}
+
+func isSimpleCallStatement(stmt string) bool {
+	stmt = strings.TrimSpace(stmt)
+	if stmt == "" || !isIdentStartRune(rune(stmt[0])) {
+		return false
+	}
+	end := 1
+	for end < len(stmt) && isIdentPartRune(rune(stmt[end])) {
+		end++
+	}
+	open := skipSpace(stmt, end)
+	if open >= len(stmt) || stmt[open] != '(' {
+		return false
+	}
+	close := findMatching(stmt, open, '(', ')')
+	return close == len(stmt)-1
+}
+
+func isPostIncDec(stmt string) bool {
+	stmt = strings.TrimSpace(stmt)
+	if strings.HasSuffix(stmt, "++") || strings.HasSuffix(stmt, "--") {
+		return isIdentifier(strings.TrimSpace(stmt[:len(stmt)-2]))
+	}
+	return false
+}
+
+func isAssignableTarget(left string) bool {
+	left = strings.TrimSpace(left)
+	if isIdentifier(left) {
+		return true
+	}
+	open := strings.IndexByte(left, '[')
+	if open <= 0 || !strings.HasSuffix(left, "]") {
+		return false
+	}
+	return isIdentifier(strings.TrimSpace(left[:open])) && strings.TrimSpace(left[open+1:len(left)-1]) != ""
+}
+
+func parsePerformanceNowDelta(expr string) (string, bool) {
+	expr = strings.TrimSpace(expr)
+	const prefix = "performance.now()"
+	if !strings.HasPrefix(expr, prefix) {
+		return "", false
+	}
+	pos := skipSpace(expr, len(prefix))
+	if pos >= len(expr) || expr[pos] != '-' {
+		return "", false
+	}
+	pos = skipSpace(expr, pos+1)
+	name := strings.TrimSpace(expr[pos:])
+	return name, isIdentifier(name)
+}
+
+func parseJSONTypeSend(expr string) (string, bool) {
+	expr = strings.TrimSpace(expr)
+	const prefix = "res.type"
+	if !strings.HasPrefix(expr, prefix) {
+		return "", false
+	}
+	openType := skipSpace(expr, len(prefix))
+	if openType >= len(expr) || expr[openType] != '(' {
+		return "", false
+	}
+	closeType := findMatching(expr, openType, '(', ')')
+	if closeType < 0 {
+		return "", false
+	}
+	contentType, err := strconv.Unquote(strings.TrimSpace(expr[openType+1 : closeType]))
+	if err != nil || contentType != "application/json" {
+		return "", false
+	}
+	rest := strings.TrimSpace(expr[closeType+1:])
+	const sendPrefix = ".send"
+	if !strings.HasPrefix(rest, sendPrefix) {
+		return "", false
+	}
+	openSend := skipSpace(rest, len(sendPrefix))
+	if openSend >= len(rest) || rest[openSend] != '(' {
+		return "", false
+	}
+	closeSend := findMatching(rest, openSend, '(', ')')
+	if closeSend != len(rest)-1 {
+		return "", false
+	}
+	name := strings.TrimSpace(rest[openSend+1 : closeSend])
+	return name, isIdentifier(name)
+}
+
+func replaceIdentifier(src string, name string, replacement string) string {
+	var out strings.Builder
+	for pos := 0; pos < len(src); {
+		idx := strings.Index(src[pos:], name)
+		if idx < 0 {
+			out.WriteString(src[pos:])
+			break
+		}
+		idx += pos
+		end := idx + len(name)
+		if (idx == 0 || !isIdentPartRune(rune(src[idx-1]))) && (end >= len(src) || !isIdentPartRune(rune(src[end]))) {
+			out.WriteString(src[pos:idx])
+			out.WriteString(replacement)
+			pos = end
+			continue
+		}
+		out.WriteString(src[pos:end])
+		pos = end
+	}
+	return out.String()
+}
+
+func hasAddAssign(src string, name string) bool {
+	for pos := 0; pos < len(src); {
+		idx := strings.Index(src[pos:], name)
+		if idx < 0 {
+			return false
+		}
+		idx += pos
+		end := idx + len(name)
+		if (idx == 0 || !isIdentPartRune(rune(src[idx-1]))) && (end >= len(src) || !isIdentPartRune(rune(src[end]))) {
+			next := skipSpace(src, end)
+			if strings.HasPrefix(src[next:], "+=") {
+				return true
+			}
+		}
+		pos = end
+	}
+	return false
+}
+
+func containsIdentifier(src string, name string) bool {
+	for pos := 0; pos < len(src); {
+		idx := strings.Index(src[pos:], name)
+		if idx < 0 {
+			return false
+		}
+		idx += pos
+		end := idx + len(name)
+		if (idx == 0 || !isIdentPartRune(rune(src[idx-1]))) && (end >= len(src) || !isIdentPartRune(rune(src[end]))) {
+			return true
+		}
+		pos = end
+	}
+	return false
+}
+
+func isIdentifier(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || !isIdentStartRune(rune(value[0])) {
+		return false
+	}
+	for _, r := range value[1:] {
+		if !isIdentPartRune(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func isDecimalLiteral(expr string) bool {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return false
+	}
+	if expr[0] == '-' {
+		expr = expr[1:]
+	}
+	if expr == "" {
+		return false
+	}
+	dot := false
+	digitsBefore := 0
+	digitsAfter := 0
+	for _, r := range expr {
+		switch {
+		case r == '.':
+			if dot {
+				return false
+			}
+			dot = true
+		case r >= '0' && r <= '9':
+			if dot {
+				digitsAfter++
+			} else {
+				digitsBefore++
+			}
+		default:
+			return false
+		}
+	}
+	return dot && digitsBefore > 0 && digitsAfter > 0
 }
 
 func findTopLevelColon(src string) int {

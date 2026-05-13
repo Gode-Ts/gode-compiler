@@ -29,11 +29,12 @@ export default app
 	}
 	for _, want := range []string{
 		`"github.com/Gode-Ts/gopress"`,
+		`"strconv"`,
 		"func BuildGopressApp() *gopress.App",
 		"app := gopress.New()",
 		"app.Use(gopress.JSON())",
-		`app.Get("/users/:id", func(req *gopress.Request, res *gopress.Response, next gopress.NextFunc) error {`,
-		`return res.Status(200).JSON(map[string]any{"id": req.Params["id"]})`,
+		`app.HandleFastOptions("GET", "/users/:id", gopress.FastRequestOptions{}, func(req *gopress.Request, res *gopress.Response) error {`,
+		`return res.StatusJSON(200, "{\"id\":"+strconv.Quote(req.Param("id"))+"}")`,
 		"return app",
 	} {
 		if !strings.Contains(result.Go, want) {
@@ -44,6 +45,28 @@ export default app
 		if !strings.Contains(result.Metadata, want) {
 			t.Fatalf("route metadata missing %q:\n%s", want, result.Metadata)
 		}
+	}
+}
+
+func TestGopressInlineFastHandlerDoesNotEmitUnreachableReturnNil(t *testing.T) {
+	src := []byte(`
+import gopress, { Request, Response } from "gopress"
+
+const app = gopress()
+
+app.get("/ok", async (req: Request, res: Response) => {
+  return res.status(200).send("ok")
+})
+
+export default app
+`)
+
+	result := compiler.CompileFile("app.ts", src, config.Default().WithFramework("gopress").WithPackage("main"))
+	if result.Diagnostics.HasErrors() {
+		t.Fatalf("unexpected diagnostics:\n%s", result.Diagnostics.String())
+	}
+	if strings.Contains(result.Go, "return res.Status(200).Send(\"ok\")\n\t\treturn nil") {
+		t.Fatalf("generated handler should not include unreachable return nil:\n%s", result.Go)
 	}
 }
 
@@ -86,6 +109,31 @@ export default app
 		if !strings.Contains(result.Go, want) {
 			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
 		}
+	}
+}
+
+func TestGopressInlineHandlerWithQueryUsesCompatibleRequestPath(t *testing.T) {
+	src := []byte(`
+import gopress, { Request, Response } from "gopress"
+
+const app = gopress()
+
+app.get("/search", async (req: Request, res: Response) => {
+  return res.send(req.query.page)
+})
+
+export default app
+`)
+
+	result := compiler.CompileFile("app.ts", src, config.Default().WithFramework("gopress").WithPackage("main"))
+	if result.Diagnostics.HasErrors() {
+		t.Fatalf("unexpected diagnostics:\n%s", result.Diagnostics.String())
+	}
+	if !strings.Contains(result.Go, `app.HandleFastOptions("GET", "/search", gopress.FastRequestOptions{Query: true}, func(req *gopress.Request, res *gopress.Response) error {`) {
+		t.Fatalf("handler that reads req.query should use selective fast request path:\n%s", result.Go)
+	}
+	if strings.Contains(result.Go, `app.Get("/search"`) {
+		t.Fatalf("handler that reads req.query should not fall back to compatible request path:\n%s", result.Go)
 	}
 }
 
@@ -183,9 +231,9 @@ export default app
 	}
 	for _, want := range []string{
 		`"time"`,
-		"func runLoop(iterations float64) map[string]any",
-		"sum := 0.0",
-		"for i := 0.0; i < iterations; i++ {",
+		"func runLoop(iterations int) map[string]any",
+		"sum := 0",
+		"for i := 0; i < iterations; i++ {",
 		"sum += i",
 		`return map[string]any{"iterations": iterations, "sum": sum}`,
 		"const iterations = 1000000",
@@ -198,6 +246,9 @@ export default app
 		if !strings.Contains(result.Go, want) {
 			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
 		}
+	}
+	if strings.Contains(result.Go, `"strconv"`) {
+		t.Fatalf("spread fallback should not leave unused strconv import:\n%s", result.Go)
 	}
 }
 
@@ -224,7 +275,7 @@ export default app
 	}
 }
 
-func TestGopressJSONStringAccumulatorUsesBuilder(t *testing.T) {
+func TestGopressJSONStringAccumulatorUsesByteBuffer(t *testing.T) {
 	src := []byte(`
 import gopress, { Request, Response } from "gopress"
 
@@ -252,22 +303,103 @@ export default app
 		t.Fatalf("unexpected diagnostics:\n%s", result.Diagnostics.String())
 	}
 	for _, want := range []string{
-		`"strings"`,
 		`"strconv"`,
-		"var payload strings.Builder",
-		`payload.WriteString("{\"items\":[")`,
-		`payload.WriteString(",")`,
-		`payload.WriteString("{\"id\":")`,
-		`payload.WriteString(strconv.FormatFloat(i, 'f', -1, 64))`,
-		`payload.WriteString(",\"name\":\"note\"}")`,
-		`payload.WriteString("]}")`,
-		`return res.Type("application/json").Send(payload.String())`,
+		"payload := make([]byte, 0, ",
+		`payload = append(payload, "{\"items\":["...)`,
+		`payload = append(payload, ","...)`,
+		`payload = append(payload, "{\"id\":"...)`,
+		`payload = strconv.AppendInt(payload, int64(i), 10)`,
+		`payload = append(payload, ",\"name\":\"note\"}"...)`,
+		`payload = append(payload, "]}"...)`,
+		`return res.JSONBytes(payload)`,
 	} {
 		if !strings.Contains(result.Go, want) {
 			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
 		}
 	}
+	if strings.Contains(result.Go, `"strings"`) || strings.Contains(result.Go, "strings.Builder") {
+		t.Fatalf("generated Go should use []byte for JSON payloads, not strings.Builder:\n%s", result.Go)
+	}
 	if strings.Contains(result.Go, "payload +=") {
 		t.Fatalf("generated Go should not concatenate payload repeatedly:\n%s", result.Go)
+	}
+}
+
+func TestGopressJSONStringAccumulatorKeepsConstStringParts(t *testing.T) {
+	src := []byte(`
+import gopress, { Request, Response } from "gopress"
+
+const app = gopress()
+
+app.get("/json", async (req: Request, res: Response) => {
+  const chunk = "{\"id\":1}"
+  let payload = "["
+  payload += chunk
+  payload += "]"
+  return res.type("application/json").send(payload)
+})
+
+export default app
+`)
+
+	result := compiler.CompileFile("app.ts", src, config.Default().WithFramework("gopress").WithPackage("main"))
+	if result.Diagnostics.HasErrors() {
+		t.Fatalf("unexpected diagnostics:\n%s", result.Diagnostics.String())
+	}
+	for _, want := range []string{
+		`const chunk = "{\"id\":1}"`,
+		`payload = append(payload, chunk...)`,
+		`return res.JSONBytes(payload)`,
+	} {
+		if !strings.Contains(result.Go, want) {
+			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
+		}
+	}
+	if strings.Contains(result.Go, "FormatFloat(chunk") {
+		t.Fatalf("generated Go should not treat const string chunk as a number:\n%s", result.Go)
+	}
+}
+
+func TestGopressJSONByteBufferDetectionAllowsWhitespace(t *testing.T) {
+	src := []byte(`
+import gopress, { Request, Response } from "gopress"
+
+const app = gopress()
+
+app.get("/json", async (req: Request, res: Response) => {
+  let payload = "["
+  payload += "{\"id\":1}"
+  payload += "]"
+  return res.type("application/json")
+    .send(payload)
+})
+
+export default app
+`)
+
+	result := compiler.CompileFile("app.ts", src, config.Default().WithFramework("gopress").WithPackage("main"))
+	if result.Diagnostics.HasErrors() {
+		t.Fatalf("unexpected diagnostics:\n%s", result.Diagnostics.String())
+	}
+	for _, want := range []string{
+		"payload := make([]byte, 0, ",
+		`return res.JSONBytes(payload)`,
+	} {
+		if !strings.Contains(result.Go, want) {
+			t.Fatalf("generated Go missing %q:\n%s", want, result.Go)
+		}
+	}
+}
+
+func TestGopressCompilerAvoidsRegexAllocationChurn(t *testing.T) {
+	cfg := config.Default().WithFramework("gopress").WithPackage("main")
+	allocs := testing.AllocsPerRun(10, func() {
+		result := compiler.CompileFile("app.ts", gopressBenchmarkSource, cfg)
+		if result.Diagnostics.HasErrors() {
+			t.Fatalf("unexpected diagnostics:\n%s", result.Diagnostics.String())
+		}
+	})
+	if allocs > 5000 {
+		t.Fatalf("gopress compiler allocations too high: got %.0f allocs/run, want <= 5000", allocs)
 	}
 }
