@@ -2006,6 +2006,9 @@ func (c *gopressBodyContext) compileResponseJSONByteStatement(expr string) ([]st
 	if !ok {
 		return nil, false
 	}
+	if raw, ok := compileStaticJSONLiteral(arg); ok {
+		return []string{"return res.Status(" + status + ").JSONString(" + raw + ")"}, true
+	}
 	fields, ok := c.flattenJSONFields(arg)
 	if !ok {
 		return nil, false
@@ -2047,6 +2050,9 @@ func parseResponseJSONCall(expr string) (string, string, bool) {
 }
 
 func (c *gopressBodyContext) compileRawJSONByteResponse(status string, expr string) ([]string, bool) {
+	if raw, ok := compileStaticJSONLiteral(expr); ok {
+		return []string{"return gopress.WriteJSONString(w, " + status + ", " + raw + ")"}, true
+	}
 	fields, ok := c.flattenJSONFields(expr)
 	if !ok {
 		return nil, false
@@ -2055,6 +2061,160 @@ func (c *gopressBodyContext) compileRawJSONByteResponse(status string, expr stri
 	lines := c.compileJSONByteFields(name, fields)
 	lines = append(lines, "return gopress.WriteJSONBytes(w, "+status+", "+name+")")
 	return lines, true
+}
+
+func compileStaticJSONLiteral(expr string) (string, bool) {
+	if !couldBeStaticJSONLiteral(expr) {
+		return "", false
+	}
+	fields, ok := parseGopressObjectFields(expr)
+	if !ok {
+		return "", false
+	}
+	var out strings.Builder
+	out.WriteByte('{')
+	for idx, field := range fields {
+		if field.Dynamic {
+			return "", false
+		}
+		value, ok := staticJSONValue(field.Expr)
+		if !ok {
+			return "", false
+		}
+		if idx > 0 {
+			out.WriteByte(',')
+		}
+		key, err := json.Marshal(field.Key)
+		if err != nil {
+			return "", false
+		}
+		out.Write(key)
+		out.WriteByte(':')
+		out.WriteString(value)
+	}
+	out.WriteByte('}')
+	return strconv.Quote(out.String()), true
+}
+
+func couldBeStaticJSONLiteral(expr string) bool {
+	expr = strings.TrimSpace(expr)
+	if !strings.HasPrefix(expr, "{") {
+		return false
+	}
+	close := findMatching(expr, 0, '{', '}')
+	if close != len(expr)-1 {
+		return false
+	}
+	pos := skipSpace(expr, 1)
+	for pos < close {
+		colon := findTopLevelColon(expr[pos:close])
+		if colon < 0 {
+			return false
+		}
+		valueStart := skipSpace(expr, pos+colon+1)
+		valueEnd, ok := staticJSONValueEnd(expr, valueStart, close)
+		if !ok {
+			return false
+		}
+		pos = skipSpace(expr, valueEnd)
+		if pos == close {
+			return true
+		}
+		if expr[pos] != ',' {
+			return false
+		}
+		pos = skipSpace(expr, pos+1)
+	}
+	return true
+}
+
+func staticJSONValueEnd(expr string, pos int, limit int) (int, bool) {
+	if pos >= limit {
+		return pos, false
+	}
+	switch expr[pos] {
+	case '"', '\'':
+		return staticJSONStringEnd(expr, pos, limit)
+	case 't':
+		return staticJSONKeywordEnd(expr, pos, limit, "true")
+	case 'f':
+		return staticJSONKeywordEnd(expr, pos, limit, "false")
+	case 'n':
+		return staticJSONKeywordEnd(expr, pos, limit, "null")
+	default:
+		return staticJSONNumberEnd(expr, pos, limit)
+	}
+}
+
+func staticJSONStringEnd(expr string, pos int, limit int) (int, bool) {
+	quote := expr[pos]
+	escaped := false
+	for pos++; pos < limit; pos++ {
+		ch := expr[pos]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		if ch == quote {
+			return pos + 1, true
+		}
+	}
+	return pos, false
+}
+
+func staticJSONKeywordEnd(expr string, pos int, limit int, keyword string) (int, bool) {
+	end := pos + len(keyword)
+	if end > limit || expr[pos:end] != keyword {
+		return pos, false
+	}
+	return end, true
+}
+
+func staticJSONNumberEnd(expr string, pos int, limit int) (int, bool) {
+	if expr[pos] == '-' {
+		pos++
+	}
+	start := pos
+	dot := false
+	for pos < limit {
+		ch := expr[pos]
+		switch {
+		case ch >= '0' && ch <= '9':
+			pos++
+		case ch == '.' && !dot:
+			dot = true
+			pos++
+		default:
+			return pos, pos > start
+		}
+	}
+	return pos, pos > start
+}
+
+func staticJSONValue(expr string) (string, bool) {
+	expr = strings.TrimSpace(expr)
+	switch {
+	case isStringLiteral(expr):
+		value, err := strconv.Unquote(expr)
+		if err != nil {
+			return "", false
+		}
+		data, err := json.Marshal(value)
+		if err != nil {
+			return "", false
+		}
+		return string(data), true
+	case expr == "true" || expr == "false" || expr == "null":
+		return expr, true
+	case isIntegerLiteral(expr) || isDecimalLiteral(expr):
+		return expr, true
+	default:
+		return "", false
+	}
 }
 
 func (c *gopressBodyContext) nextJSONVar() string {
